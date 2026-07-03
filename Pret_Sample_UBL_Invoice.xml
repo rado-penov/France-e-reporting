@@ -1,0 +1,195 @@
+<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2" xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:ccts="urn:un:unece:uncefact:documentation:2" xmlns:qdt="urn:oasis:names:specification:ubl:schema:xsd:QualifiedDatatypes-2" xmlns:udt="urn:oasis:names:specification:ubl:schema:xsd:UnqualifiedDataTypes-2">
+	<cbc:UBLVersionID>2.1</cbc:UBLVersionID>
+	<cbc:CustomizationID>urn:cen.eu:en16931:2017</cbc:CustomizationID>
+	<cbc:ProfileID>B1</cbc:ProfileID>
+	<cbc:ID>PRETTEST1</cbc:ID>
+	<cbc:IssueDate>2026-05-01</cbc:IssueDate>
+	<cbc:DueDate>2026-06-01</cbc:DueDate>
+	<cbc:InvoiceTypeCode>380</cbc:InvoiceTypeCode>
+	<cbc:Note>#REG#aaa</cbc:Note>
+	<cbc:Note>#ABL#zzz</cbc:Note>
+	<cbc:Note>#AAI#eee</cbc:Note>
+	<cbc:Note>#PMD#rrr</cbc:Note>
+	<cbc:Note>#PMT#Indemnité forfaitaire pour frais de recouvrement en cas de retard de paiement : 40 €.</cbc:Note>
+	<cbc:Note>#AAB#ttt</cbc:Note>
+	<cbc:DocumentCurrencyCode>EUR</cbc:DocumentCurrencyCode>
+	<cbc:AccountingCost>REF COMPTABLE ACHETEUR</cbc:AccountingCost>
+	<cbc:BuyerReference>SERVEXEC</cbc:BuyerReference>
+	<cac:InvoicePeriod>
+		<cbc:StartDate>2026-05-01</cbc:StartDate>
+		<cbc:EndDate>2026-05-31</cbc:EndDate>
+		<cbc:DescriptionCode>3</cbc:DescriptionCode>
+	</cac:InvoicePeriod>
+	<cac:OrderReference>
+		<cbc:ID>PO00000002</cbc:ID>
+		<cbc:SalesOrderID>BON VENTE REF 2547</cbc:SalesOrderID>
+	</cac:OrderReference>
+	<cac:DespatchDocumentReference>
+		<cbc:ID>AVISLIVRAISON_001</cbc:ID>
+	</cac:DespatchDocumentReference>
+	<cac:ReceiptDocumentReference>
+		<cbc:ID>BON_RECEPT_001</cbc:ID>
+	</cac:ReceiptDocumentReference>
+	<cac:OriginatorDocumentReference>
+		<cbc:ID>APPEL_OFFRE-0001</cbc:ID>
+	</cac:OriginatorDocumentReference>
+	<cac:ContractDocumentReference>
+		<cbc:ID>CT00000000001</cbc:ID>
+	</cac:ContractDocumentReference>
+	<cac:ProjectReference>
+		<cbc:ID>PROJET_0001</cbc:ID>
+	</cac:ProjectReference>
+	<cac:AccountingSupplierParty>
+		<cac:Party>
+			<cbc:EndpointID schemeID="0225">533214003</cbc:EndpointID>
+			<cac:PartyIdentification>
+				<cbc:ID schemeID="0009">533214003</cbc:ID>
+			</cac:PartyIdentification>
+			<cac:PartyName>
+				<cbc:Name>TESTCOMPANYSENDING</cbc:Name>
+			</cac:PartyName>
+			<cac:PostalAddress>
+				<cbc:StreetName>20 RUE CAUMARTIN</cbc:StreetName>
+				<cbc:AdditionalStreetName>Etage 2</cbc:AdditionalStreetName>
+				<cbc:CityName>PARIS</cbc:CityName>
+				<cbc:PostalZone>75020</cbc:PostalZone>
+				<cac:Country>
+					<cbc:IdentificationCode>FR</cbc:IdentificationCode>
+				</cac:Country>
+			</cac:PostalAddress>
+			<cac:PartyTaxScheme>
+				<cbc:CompanyID>FR776846277543</cbc:CompanyID>
+				<cac:TaxScheme>
+					<cbc:ID>VAT</cbc:ID>
+				</cac:TaxScheme>
+			</cac:PartyTaxScheme>
+			<cac:PartyLegalEntity>
+				<cbc:RegistrationName>PRET</cbc:RegistrationName>
+				<cbc:CompanyID schemeID="0002">533214003</cbc:CompanyID>
+				<cbc:CompanyLegalForm>SARL AU CAPITAL DE 50 000 EUROS</cbc:CompanyLegalForm>
+			</cac:PartyLegalEntity>
+			<cac:Contact>
+				<cbc:Name>MME CONTACT(DEP ADV)</cbc:Name>
+				<cbc:Telephone>01 02 03 54 87</cbc:Telephone>
+				<cbc:ElectronicMail>contact@abc.fr</cbc:ElectronicMail>
+			</cac:Contact>
+		</cac:Party>
+	</cac:AccountingSupplierParty>
+	<cac:AccountingCustomerParty>
+		<cac:Party>
+			<cbc:EndpointID schemeID="0225">533214003</cbc:EndpointID>
+			<cac:PartyIdentification>
+				<cbc:ID schemeID="0009">533214003</cbc:ID>
+			</cac:PartyIdentification>
+			<cac:PartyName>
+				<cbc:Name>DUMMY COMPANY</cbc:Name>
+			</cac:PartyName>
+			<cac:PostalAddress>
+				<cbc:StreetName>RUE</cbc:StreetName>
+				<cbc:AdditionalStreetName>67 RUE JULES FERRY</cbc:AdditionalStreetName>
+				<cbc:CityName>LA GARENNE COLOMBES</cbc:CityName>
+				<cbc:PostalZone>92250</cbc:PostalZone>
+				<cac:Country>
+					<cbc:IdentificationCode>FR</cbc:IdentificationCode>
+				</cac:Country>
+			</cac:PostalAddress>
+			<cac:PartyTaxScheme>
+				<cbc:CompanyID>FR13542107651</cbc:CompanyID>
+				<cac:TaxScheme>
+					<cbc:ID>VAT</cbc:ID>
+				</cac:TaxScheme>
+			</cac:PartyTaxScheme>
+			<cac:PartyLegalEntity>
+				<cbc:CompanyID schemeID="0002">533214003</cbc:CompanyID>
+			</cac:PartyLegalEntity>
+			<cac:Contact>
+				<cbc:Name>Contact ACHETEUR(DEP COMPTAFOUR)</cbc:Name>
+				<cbc:Telephone>01 01 25 45 87</cbc:Telephone>
+				<cbc:ElectronicMail>contact@abc.fr</cbc:ElectronicMail>
+			</cac:Contact>
+		</cac:Party>
+	</cac:AccountingCustomerParty>
+	<cac:Delivery>
+		<cbc:ActualDeliveryDate>2026-05-31</cbc:ActualDeliveryDate>
+		<cac:DeliveryLocation>
+			<cbc:ID>PRIVATE_ID_DELIVERY</cbc:ID>
+			<cac:Address>
+				<cbc:StreetName>ADRESSE LIVRAISON LIGNE 1</cbc:StreetName>
+				<cbc:AdditionalStreetName>AD LIV ligne 2</cbc:AdditionalStreetName>
+				<cbc:CityName>NICE</cbc:CityName>
+				<cbc:PostalZone>06000</cbc:PostalZone>
+				<cac:Country>
+					<cbc:IdentificationCode>FR</cbc:IdentificationCode>
+				</cac:Country>
+			</cac:Address>
+		</cac:DeliveryLocation>
+		<cac:DeliveryParty>
+			<cac:PartyName>
+				<cbc:Name>NOM LIVRé</cbc:Name>
+			</cac:PartyName>
+		</cac:DeliveryParty>
+	</cac:Delivery>
+	<cac:PaymentMeans>
+		<cbc:PaymentMeansCode>30</cbc:PaymentMeansCode>
+		<cac:PayeeFinancialAccount>
+			<cbc:ID>FR7610107001011234567890129</cbc:ID>
+			<cbc:Name>MON COMPTE BANCAIRE</cbc:Name>
+			<cac:FinancialInstitutionBranch>
+				<cbc:ID>CIC</cbc:ID>
+			</cac:FinancialInstitutionBranch>
+		</cac:PayeeFinancialAccount>
+		<cac:PaymentMandate>
+			<cbc:ID>REF MANDAT ICS</cbc:ID>
+			<cac:PayerFinancialAccount>
+				<cbc:ID>CPTE DEBIT</cbc:ID>
+			</cac:PayerFinancialAccount>
+		</cac:PaymentMandate>
+	</cac:PaymentMeans>
+	<cac:PaymentTerms>
+		<cbc:Note>PAIEMENT 30 JOURS NET</cbc:Note>
+	</cac:PaymentTerms>
+	<cac:TaxTotal>
+		<cbc:TaxAmount currencyID="EUR">2000.00</cbc:TaxAmount>
+		<cac:TaxSubtotal>
+			<cbc:TaxableAmount currencyID="EUR">10000.00</cbc:TaxableAmount>
+			<cbc:TaxAmount currencyID="EUR">2000.00</cbc:TaxAmount>
+			<cac:TaxCategory>
+				<cbc:ID>S</cbc:ID>
+				<cbc:Percent>20.0</cbc:Percent>
+				<cac:TaxScheme>
+					<cbc:ID>VAT</cbc:ID>
+				</cac:TaxScheme>
+			</cac:TaxCategory>
+		</cac:TaxSubtotal>
+	</cac:TaxTotal>
+	<cac:LegalMonetaryTotal>
+		<cbc:LineExtensionAmount currencyID="EUR">10000.00</cbc:LineExtensionAmount>
+		<cbc:TaxExclusiveAmount currencyID="EUR">10000.00</cbc:TaxExclusiveAmount>
+		<cbc:TaxInclusiveAmount currencyID="EUR">12000.00</cbc:TaxInclusiveAmount>
+		<cbc:PayableAmount currencyID="EUR">12000.00</cbc:PayableAmount>
+	</cac:LegalMonetaryTotal>
+	<cac:InvoiceLine>
+		<cbc:ID>001</cbc:ID>
+		<cbc:InvoicedQuantity unitCode="ZZ">1.0</cbc:InvoicedQuantity>
+		<cbc:LineExtensionAmount currencyID="EUR">10000</cbc:LineExtensionAmount>
+		<cac:OrderLineReference>
+			<cbc:LineID>1</cbc:LineID>
+		</cac:OrderLineReference>
+		<cac:Item>
+			<cbc:Name>Prestations diverses</cbc:Name>
+			<cac:SellersItemIdentification>
+				<cbc:ID>0987</cbc:ID>
+			</cac:SellersItemIdentification>
+			<cac:ClassifiedTaxCategory>
+				<cbc:ID>S</cbc:ID>
+				<cbc:Percent>20.0</cbc:Percent>
+				<cac:TaxScheme>
+					<cbc:ID>VAT</cbc:ID>
+				</cac:TaxScheme>
+			</cac:ClassifiedTaxCategory>
+		</cac:Item>
+		<cac:Price>
+			<cbc:PriceAmount currencyID="EUR">10000.00</cbc:PriceAmount>
+		</cac:Price>
+	</cac:InvoiceLine>
+</Invoice>
