@@ -46,7 +46,7 @@ Create these on the Script record (Parameters subtab), then set values on the De
 | `custscript_pret_api_function_key_pr` | Payments Report API Function Key | Free-Form Text | Sent as the `X-Function-Key` header |
 | `custscript_pret_api_doc_type_pr` | Payments Report API Doc Type | Free-Form Text | Sent as the `x-pret-document-type` header |
 | `custscript_pret_ubl_folder_pr` | Payments Report File Cabinet Folder | Integer | Internal ID of the File Cabinet folder the XML archive is saved to |
-| `custscript_pret_today_pr` | Payments Report Test "Today" Override | Free-Form Text | **Test only** — leave blank in production (see §6) |
+| `custscript_pret_today_pr` | Payments Report Test "Today" Override | Date | **Test only** — leave blank in production (see §6) |
 
 If `custscript_pret_api_url_pr` / `_function_key_pr` / `_doc_type_pr` are not all set, the script
 still saves the XML to the File Cabinet but logs `PAYMENTS REPORT API SKIPPED` instead of sending it.
@@ -98,14 +98,13 @@ specific run.
 
 To simulate a 1st/11th/21st run without waiting for the calendar date, set
 `custscript_pret_today_pr` on the deployment (or via a manual "Execute Script" test) to any date
-in your NetSuite date format, e.g. `11/07/2026`.
+using the field's date picker (it's a Date-type parameter, e.g. `11/7/2026`).
 
 - The script computes the reporting window and the `RPT-YYYY-DDMM` report ID **as if** that were
   today's date.
 - `IssueDateTime/DateTimeString` in the output XML always uses the real current timestamp
   (it records when the file was actually generated, not the simulated day).
-- Leave this parameter **blank** on the production deployment — a non-empty value that isn't a
-  valid date logs `PAYMENTS REPORT TODAY PARAM INVALID` and falls back to the real system date.
+- Leave this parameter **blank** on the production deployment.
 
 Reporting windows recap:
 

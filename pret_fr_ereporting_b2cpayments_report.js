@@ -134,7 +134,10 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/record', 'N/format', 'N
     }
 
     // ── date / window helpers ────────────────────────────────────────────────
+    // custscript_pret_today_pr is a Date-type parameter, so NetSuite hands back a Date object
+    // directly. The string-parse branch is a defensive fallback in case it's ever redefined as text.
     function resolveToday(todayParam) {
+        if (todayParam instanceof Date) return todayParam;
         if (todayParam) {
             try {
                 return format.parse({ value: todayParam, type: format.Type.DATE });
