@@ -34,10 +34,13 @@
  * same VAT/Name/email in both, RoleCode stays SENDER for Sender and SE for Issuer.
  *
  * Script Parameters (defined on the Script record in NetSuite):
- *   custscript_pret_api_url_pr           Free-form text — API endpoint URL
- *   custscript_pret_api_function_key_pr  Free-form text — Value sent as the X-Function-Key header
- *   custscript_pret_api_doc_type_pr      Free-form text — Value sent as the x-pret-document-type header
- *   custscript_pret_ubl_folder_pr        Integer        — File Cabinet folder ID for XML files
+ *   custscript_pret_api_url_pr              Free-form text            — API endpoint URL
+ *   custscript_pret_oauth_token_url_pr      Free-form text            — OAuth2 token endpoint URL (client_credentials grant)
+ *   custscript_pret_oauth_client_id_pr      Free-form text            — OAuth2 client_id
+ *   custscript_pret_oauth_client_secret_pr  Free-form Text (Password) — OAuth2 client_secret
+ *   custscript_pret_oauth_scope_pr          Free-form text            — OAuth2 scope
+ *   custscript_pret_api_doc_type_pr         Free-form text            — Value sent as the X-Pret-Document-Type header
+ *   custscript_pret_ubl_folder_pr           Integer                   — File Cabinet folder ID for XML files
  *   custscript_pret_today_pr             Free-form text — TEST ONLY. When set, the script behaves
  *                                         as if "today" were this date (enter in your NetSuite
  *                                         date format), so you can simulate the 1st/11th/21st runs.
@@ -53,15 +56,19 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/record', 'N/format', 'N
     function execute(context) {
         try {
             const script      = runtime.getCurrentScript();
-            const apiUrl      = script.getParameter({ name: 'custscript_pret_api_url_pr' });
-            const apiKey      = script.getParameter({ name: 'custscript_pret_api_function_key_pr' });
-            const apiDocType  = script.getParameter({ name: 'custscript_pret_api_doc_type_pr' });
+            const apiUrl       = script.getParameter({ name: 'custscript_pret_api_url_pr' });
+            const tokenUrl     = script.getParameter({ name: 'custscript_pret_oauth_token_url_pr' });
+            const clientId     = script.getParameter({ name: 'custscript_pret_oauth_client_id_pr' });
+            const clientSecret = script.getParameter({ name: 'custscript_pret_oauth_client_secret_pr' });
+            const scope        = script.getParameter({ name: 'custscript_pret_oauth_scope_pr' });
+            const apiDocType   = script.getParameter({ name: 'custscript_pret_api_doc_type_pr' });
             const folderId    = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder_pr' }), 10);
             const todayParam  = script.getParameter({ name: 'custscript_pret_today_pr' });
 
             if (!folderId || isNaN(folderId)) throw new Error('custscript_pret_ubl_folder_pr parameter is not set on the deployment');
 
-            log.audit('PAYMENTS REPORT START', `Deployment: ${script.deploymentId} | url set: ${!!apiUrl} | functionKey set: ${!!apiKey} | docType: ${apiDocType || '(empty)'} | folderId: ${folderId} | todayParam: ${todayParam || '(not set)'}`);
+            const oauthConfigured = !!(tokenUrl && clientId && clientSecret && scope);
+            log.audit('PAYMENTS REPORT START', `Deployment: ${script.deploymentId} | url set: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'} | folderId: ${folderId} | todayParam: ${todayParam || '(not set)'}`);
 
             const today = resolveToday(todayParam);
             log.debug('PAYMENTS REPORT TODAY RESOLVED', `Today: ${fmtYYYYMMDD(today)} (day of month: ${today.getDate()})`);
@@ -102,16 +109,17 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/record', 'N/format', 'N
             const fileId = xmlFile.save();
             log.audit('PAYMENTS REPORT FILE SAVED', `File: ${fileName} | File ID: ${fileId}`);
 
-            if (apiUrl && apiKey && apiDocType) {
+            if (apiUrl && oauthConfigured && apiDocType) {
                 try {
+                    const bearerToken = getBearerToken(tokenUrl, clientId, clientSecret, scope);
                     log.audit('PAYMENTS REPORT API CALLING', `POST ${apiUrl}`);
                     const response = https.post({
                         url:  apiUrl,
                         body: xml,
                         headers: {
-                            'Content-Type':         'application/xml',
-                            'X-Function-Key':       apiKey,
-                            'x-pret-document-type': apiDocType
+                            'Content-Type':           'application/xml',
+                            'Authorization':          `Bearer ${bearerToken}`,
+                            'X-Pret-Document-Type':   apiDocType
                         }
                     });
                     if (response.code >= 200 && response.code < 300) {
@@ -123,7 +131,7 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/record', 'N/format', 'N
                     log.error('PAYMENTS REPORT API FAILED', `Name: ${apiErr.name} | Message: ${apiErr.message} | Stack: ${apiErr.stack}`);
                 }
             } else {
-                log.error('PAYMENTS REPORT API SKIPPED', `Missing parameters — url: ${!!apiUrl} | functionKey: ${!!apiKey} | docType: ${!!apiDocType}`);
+                log.error('PAYMENTS REPORT API SKIPPED', `Missing parameters — url: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${!!apiDocType}`);
             }
 
             log.audit('PAYMENTS REPORT COMPLETE', `RPT ID: ${rptId} | File ID: ${fileId} | Payments: ${payments.length}`);
@@ -222,6 +230,25 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/record', 'N/format', 'N
             });
         }
         return payments;
+    }
+
+    // ── OAuth2 helper ────────────────────────────────────────────────────────
+    // Fetches a fresh bearer token via the client_credentials grant. Called immediately
+    // before each API send so the caller never has to worry about token expiry/refresh.
+    function getBearerToken(tokenUrl, clientId, clientSecret, scope) {
+        const body = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}` +
+                     `&client_secret=${encodeURIComponent(clientSecret)}&scope=${encodeURIComponent(scope)}`;
+        const response = https.post({
+            url:     tokenUrl,
+            body:    body,
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+        if (response.code < 200 || response.code >= 300) {
+            throw new Error(`Token request failed — Status: ${response.code} | Body: ${response.body}`);
+        }
+        const parsed = JSON.parse(response.body);
+        if (!parsed.access_token) throw new Error(`Token response missing access_token — Body: ${response.body}`);
+        return parsed.access_token;
     }
 
     // ── XML helpers ──────────────────────────────────────────────────────────
