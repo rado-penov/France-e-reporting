@@ -7,10 +7,13 @@
  * export flags on the invoice.
  *
  * Script Parameters (defined on the Script record in NetSuite):
- *   custscript_pret_api_url           Free-form text — API endpoint URL
- *   custscript_pret_api_function_key  Free-form Text — Value sent as the X-Function-Key header
- *   custscript_pret_api_doc_type      Free-form text — Value sent as the x-pret-document-type header
- *   custscript_pret_ubl_folder        Integer        — File Cabinet folder ID for XML files
+ *   custscript_pret_api_url              Free-form text            — API endpoint URL
+ *   custscript_pret_oauth_token_url      Free-form text            — OAuth2 token endpoint URL (client_credentials grant)
+ *   custscript_pret_oauth_client_id      Free-form text            — OAuth2 client_id
+ *   custscript_pret_oauth_client_secret  Free-form Text (Password) — OAuth2 client_secret
+ *   custscript_pret_oauth_scope          Free-form text            — OAuth2 scope
+ *   custscript_pret_api_doc_type         Free-form text            — Value sent as the X-Pret-Document-Type header
+ *   custscript_pret_ubl_folder           Integer                   — File Cabinet folder ID for XML files
  */
 define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
 (record, file, https, runtime, log) => {
@@ -22,9 +25,12 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
 
         try {
             const script      = runtime.getCurrentScript();
-            const apiUrl      = script.getParameter({ name: 'custscript_pret_api_url' });
-            const apiKey      = script.getParameter({ name: 'custscript_pret_api_function_key' });
-            const apiDocType  = script.getParameter({ name: 'custscript_pret_api_doc_type' });
+            const apiUrl       = script.getParameter({ name: 'custscript_pret_api_url' });
+            const tokenUrl     = script.getParameter({ name: 'custscript_pret_oauth_token_url' });
+            const clientId     = script.getParameter({ name: 'custscript_pret_oauth_client_id' });
+            const clientSecret = script.getParameter({ name: 'custscript_pret_oauth_client_secret' });
+            const scope        = script.getParameter({ name: 'custscript_pret_oauth_scope' });
+            const apiDocType   = script.getParameter({ name: 'custscript_pret_api_doc_type' });
             const folderId    = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder' }), 10);
 
             if (!folderId || isNaN(folderId)) throw new Error('custscript_pret_ubl_folder parameter is not set on the deployment');
@@ -65,19 +71,21 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
             log.audit('UBL FILE SAVED', `Invoice: ${tranId} | File: ${fileName} | File ID: ${fileId}`);
 
             // Send via HTTPS API
-            log.audit('UBL API PARAMS', `Invoice: ${tranId} | url: ${apiUrl || '(empty)'} | functionKey set: ${!!apiKey} | docType: ${apiDocType || '(empty)'}`);
+            const oauthConfigured = !!(tokenUrl && clientId && clientSecret && scope);
+            log.audit('UBL API PARAMS', `Invoice: ${tranId} | url: ${apiUrl || '(empty)'} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'}`);
 
             let sentToBW = false;
-            if (apiUrl && apiKey && apiDocType) {
+            if (apiUrl && oauthConfigured && apiDocType) {
                 try {
+                    const bearerToken = getBearerToken(tokenUrl, clientId, clientSecret, scope);
                     log.audit('UBL API CALLING', `Invoice: ${tranId} | POST ${apiUrl}`);
                     const response = https.post({
                         url:  apiUrl,
                         body: xml,
                         headers: {
-                            'Content-Type':          'application/xml',
-                            'X-Function-Key':        apiKey,
-                            'x-pret-document-type':  apiDocType
+                            'Content-Type':           'application/xml',
+                            'Authorization':          `Bearer ${bearerToken}`,
+                            'X-Pret-Document-Type':   apiDocType
                         }
                     });
                     if (response.code >= 200 && response.code < 300) {
@@ -90,7 +98,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
                     log.error('UBL API FAILED', `Invoice: ${tranId} | Name: ${apiErr.name} | Message: ${apiErr.message} | Stack: ${apiErr.stack}`);
                 }
             } else {
-                log.error('UBL API SKIPPED', `Invoice: ${tranId} | Missing parameters — url: ${!!apiUrl} | functionKey: ${!!apiKey} | docType: ${!!apiDocType}`);
+                log.error('UBL API SKIPPED', `Invoice: ${tranId} | Missing parameters — url: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${!!apiDocType}`);
             }
 
             record.submitFields({
@@ -108,6 +116,25 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
         } catch (e) {
             log.error('UBL FAILED', `Invoice: ${context.newRecord.id} | ${e.message}\n${e.stack}`);
         }
+    }
+
+    // ── OAuth2 helper ────────────────────────────────────────────────────────
+    // Fetches a fresh bearer token via the client_credentials grant. Called immediately
+    // before each API send so the caller never has to worry about token expiry/refresh.
+    function getBearerToken(tokenUrl, clientId, clientSecret, scope) {
+        const body = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}` +
+                     `&client_secret=${encodeURIComponent(clientSecret)}&scope=${encodeURIComponent(scope)}`;
+        const response = https.post({
+            url:     tokenUrl,
+            body:    body,
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+        if (response.code < 200 || response.code >= 300) {
+            throw new Error(`Token request failed — Status: ${response.code} | Body: ${response.body}`);
+        }
+        const parsed = JSON.parse(response.body);
+        if (!parsed.access_token) throw new Error(`Token response missing access_token — Body: ${response.body}`);
+        return parsed.access_token;
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

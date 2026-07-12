@@ -13,10 +13,13 @@
  *   AccountingCustomerParty = Subsidiary  (Pret France — receiving the credit)
  *
  * Script Parameters (defined on the Script record in NetSuite):
- *   custscript_pret_api_url_vc           Free-form text — API endpoint URL
- *   custscript_pret_api_function_key_vc  Free-form text — Value sent as the X-Function-Key header
- *   custscript_pret_api_doc_type_vc      Free-form text — Value sent as the x-pret-document-type header
- *   custscript_pret_ubl_folder_vc        Free-form text — File Cabinet folder ID for XML files
+ *   custscript_pret_api_url_vc              Free-form text            — API endpoint URL
+ *   custscript_pret_oauth_token_url_vc      Free-form text            — OAuth2 token endpoint URL (client_credentials grant)
+ *   custscript_pret_oauth_client_id_vc      Free-form text            — OAuth2 client_id
+ *   custscript_pret_oauth_client_secret_vc  Free-form Text (Password) — OAuth2 client_secret
+ *   custscript_pret_oauth_scope_vc          Free-form text            — OAuth2 scope
+ *   custscript_pret_api_doc_type_vc         Free-form text            — Value sent as the X-Pret-Document-Type header
+ *   custscript_pret_ubl_folder_vc           Free-form text            — File Cabinet folder ID for XML files
  */
 define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
 (record, file, https, runtime, log) => {
@@ -36,11 +39,15 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
 
         try {
             const script     = runtime.getCurrentScript();
-            const apiUrl     = script.getParameter({ name: 'custscript_pret_api_url_vc' });
-            const apiKey     = script.getParameter({ name: 'custscript_pret_api_function_key_vc' });
-            const apiDocType = script.getParameter({ name: 'custscript_pret_api_doc_type_vc' });
-            const folderId   = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder_vc' }), 10);
-            log.audit('UBL STEP 3 - PARAMS READ', `folderId: ${folderId} | url: ${apiUrl || '(empty)'} | functionKey set: ${!!apiKey} | docType: ${apiDocType || '(empty)'}`);
+            const apiUrl       = script.getParameter({ name: 'custscript_pret_api_url_vc' });
+            const tokenUrl     = script.getParameter({ name: 'custscript_pret_oauth_token_url_vc' });
+            const clientId     = script.getParameter({ name: 'custscript_pret_oauth_client_id_vc' });
+            const clientSecret = script.getParameter({ name: 'custscript_pret_oauth_client_secret_vc' });
+            const scope        = script.getParameter({ name: 'custscript_pret_oauth_scope_vc' });
+            const apiDocType   = script.getParameter({ name: 'custscript_pret_api_doc_type_vc' });
+            const folderId     = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder_vc' }), 10);
+            const oauthConfigured = !!(tokenUrl && clientId && clientSecret && scope);
+            log.audit('UBL STEP 3 - PARAMS READ', `folderId: ${folderId} | url: ${apiUrl || '(empty)'} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'}`);
 
             if (!folderId || isNaN(folderId)) throw new Error('custscript_pret_ubl_folder_vc parameter is not set on the deployment');
 
@@ -99,19 +106,18 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
             const fileId = xmlFile.save();
             log.audit('UBL STEP 12 - FILE SAVED', `VC: ${tranId} | File: ${fileName} | File ID: ${fileId}`);
 
-            log.audit('UBL STEP 13 - API PARAMS', `VC: ${tranId} | url: ${apiUrl || '(empty)'} | functionKey set: ${!!apiKey} | docType: ${apiDocType || '(empty)'}`);
-
             let sentToBW = false;
-            if (apiUrl && apiKey && apiDocType) {
+            if (apiUrl && oauthConfigured && apiDocType) {
                 try {
+                    const bearerToken = getBearerToken(tokenUrl, clientId, clientSecret, scope);
                     log.audit('UBL STEP 14 - API CALLING', `VC: ${tranId} | POST ${apiUrl}`);
                     const response = https.post({
                         url:  apiUrl,
                         body: xml,
                         headers: {
-                            'Content-Type':         'application/xml',
-                            'X-Function-Key':       apiKey,
-                            'x-pret-document-type': apiDocType
+                            'Content-Type':           'application/xml',
+                            'Authorization':          `Bearer ${bearerToken}`,
+                            'X-Pret-Document-Type':   apiDocType
                         }
                     });
                     if (response.code >= 200 && response.code < 300) {
@@ -124,7 +130,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
                     log.error('UBL API FAILED', `VC: ${tranId} | Name: ${apiErr.name} | Message: ${apiErr.message} | Stack: ${apiErr.stack}`);
                 }
             } else {
-                log.error('UBL API SKIPPED', `VC: ${tranId} | Missing parameters — url: ${!!apiUrl} | functionKey: ${!!apiKey} | docType: ${!!apiDocType}`);
+                log.error('UBL API SKIPPED', `VC: ${tranId} | Missing parameters — url: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${!!apiDocType}`);
             }
 
             log.audit('UBL STEP 17 - STAMPING FLAGS', `VC: ${tranId} | sentToBW: ${sentToBW}`);
@@ -144,6 +150,25 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
         } catch (e) {
             log.error('UBL FAILED', `VC: ${context.newRecord.id} | ${e.message}\n${e.stack}`);
         }
+    }
+
+    // ── OAuth2 helper ────────────────────────────────────────────────────────
+    // Fetches a fresh bearer token via the client_credentials grant. Called immediately
+    // before each API send so the caller never has to worry about token expiry/refresh.
+    function getBearerToken(tokenUrl, clientId, clientSecret, scope) {
+        const body = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}` +
+                     `&client_secret=${encodeURIComponent(clientSecret)}&scope=${encodeURIComponent(scope)}`;
+        const response = https.post({
+            url:     tokenUrl,
+            body:    body,
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+        if (response.code < 200 || response.code >= 300) {
+            throw new Error(`Token request failed — Status: ${response.code} | Body: ${response.body}`);
+        }
+        const parsed = JSON.parse(response.body);
+        if (!parsed.access_token) throw new Error(`Token response missing access_token — Body: ${response.body}`);
+        return parsed.access_token;
     }
 
     // ── XML helpers ──────────────────────────────────────────────────────────
