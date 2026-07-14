@@ -2,7 +2,7 @@
  * @NApiVersion 2.1
  * @NScriptType ScheduledScript
  *
- * Builds a B2C Payments Report XML from saved search 'customsearch_pret_france_payments_report',
+ * Builds a B2B Payments Report XML from saved search 'customsearch_pret_france_payments_b2b',
  * saves it to the File Cabinet and sends it via HTTPS API.
  *
  * Intended deployment schedule: runs on the 1st, 11th and 21st of every month. Since NetSuite's
@@ -22,25 +22,27 @@
  * Saved search columns expected (matched by custom label, not internal field ID):
  *   StartDate     — Accounting Period : Start Date (grouped)  → ReportPeriod/StartDate
  *   EndDate       — Accounting Period : End Date   (grouped)  → ReportPeriod/EndDate
- *   PaymentDate   — Date (grouped)                            → Transactions/Payment/Date
+ *   InvoiceID     — Invoice Document Number (grouped)         → PaymentsReport/Invoice/InvoiceID
+ *   IssueDate     — Invoice Date (grouped)                    → PaymentsReport/Invoice/IssueDate
+ *   PaymentDate   — Date (grouped)                            → PaymentsReport/Invoice/Payment/Date
  *   TaxItem       — Tax Item (grouped, not used in the output XML)
  *   TaxRate       — Tax Item : Rate (grouped)                 → SubTotals/TaxPercent
  *   CurrencyCode  — Currency (grouped)                        → SubTotals/CurrencyCode
  *   Amount        — Amount (summed)                           → SubTotals/Amount
  *
- * Each search result row maps 1:1 to one <Payment> element.
+ * Each search result row maps 1:1 to one <Invoice> element (with a single nested <Payment>).
  *
  * Sender and Issuer blocks use fixed values: Sender is the Basware PDP, Issuer is Pret (France) SAS.
  *
  * Script Parameters (defined on the Script record in NetSuite):
- *   custscript_pret_api_url_pr              Free-form text            — API endpoint URL
- *   custscript_pret_oauth_token_url_pr      Free-form text            — OAuth2 token endpoint URL (client_credentials grant)
- *   custscript_pret_oauth_client_id_pr      Free-form text            — OAuth2 client_id
- *   custscript_pret_oauth_client_secret_pr  Free-form Text (Password) — OAuth2 client_secret
- *   custscript_pret_oauth_scope_pr          Free-form text            — OAuth2 scope
- *   custscript_pret_api_doc_type_pr         Free-form text            — Value sent as the X-Pret-Document-Type header
- *   custscript_pret_ubl_folder_pr           Integer                   — File Cabinet folder ID for XML files
- *   custscript_pret_today_pr             Free-form text — TEST ONLY. When set, the script behaves
+ *   custscript_pret_api_url_b2b              Free-form text            — API endpoint URL
+ *   custscript_pret_oauth_token_url_b2b      Free-form text            — OAuth2 token endpoint URL (client_credentials grant)
+ *   custscript_pret_oauth_client_id_b2b      Free-form text            — OAuth2 client_id
+ *   custscript_pret_oauth_client_secret_b2b  Free-form Text (Password) — OAuth2 client_secret
+ *   custscript_pret_oauth_scope_b2b          Free-form text            — OAuth2 scope
+ *   custscript_pret_api_doc_type_b2b         Free-form text            — Value sent as the X-Pret-Document-Type header
+ *   custscript_pret_ubl_folder_b2b           Integer                   — File Cabinet folder ID for XML files
+ *   custscript_pret_today_b2b             Free-form text — TEST ONLY. When set, the script behaves
  *                                         as if "today" were this date (enter in your NetSuite
  *                                         date format), so you can simulate the 1st/11th/21st runs.
  *                                         Leave blank in production.
@@ -48,53 +50,53 @@
 define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
 (search, file, https, runtime, format, log) => {
 
-    const SEARCH_ID = 'customsearch_pret_france_payments_report';
+    const SEARCH_ID = 'customsearch_pret_france_payments_b2b';
 
     // ── execute ──────────────────────────────────────────────────────────────
     function execute(context) {
         try {
             const script      = runtime.getCurrentScript();
-            const apiUrl       = script.getParameter({ name: 'custscript_pret_api_url_pr' });
-            const tokenUrl     = script.getParameter({ name: 'custscript_pret_oauth_token_url_pr' });
-            const clientId     = script.getParameter({ name: 'custscript_pret_oauth_client_id_pr' });
-            const clientSecret = script.getParameter({ name: 'custscript_pret_oauth_client_secret_pr' });
-            const scope        = script.getParameter({ name: 'custscript_pret_oauth_scope_pr' });
-            const apiDocType   = script.getParameter({ name: 'custscript_pret_api_doc_type_pr' });
-            const folderId    = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder_pr' }), 10);
-            const todayParam  = script.getParameter({ name: 'custscript_pret_today_pr' });
+            const apiUrl       = script.getParameter({ name: 'custscript_pret_api_url_b2b' });
+            const tokenUrl     = script.getParameter({ name: 'custscript_pret_oauth_token_url_b2b' });
+            const clientId     = script.getParameter({ name: 'custscript_pret_oauth_client_id_b2b' });
+            const clientSecret = script.getParameter({ name: 'custscript_pret_oauth_client_secret_b2b' });
+            const scope        = script.getParameter({ name: 'custscript_pret_oauth_scope_b2b' });
+            const apiDocType   = script.getParameter({ name: 'custscript_pret_api_doc_type_b2b' });
+            const folderId    = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder_b2b' }), 10);
+            const todayParam  = script.getParameter({ name: 'custscript_pret_today_b2b' });
 
-            if (!folderId || isNaN(folderId)) throw new Error('custscript_pret_ubl_folder_pr parameter is not set on the deployment');
+            if (!folderId || isNaN(folderId)) throw new Error('custscript_pret_ubl_folder_b2b parameter is not set on the deployment');
 
             const oauthConfigured = !!(tokenUrl && clientId && clientSecret && scope);
-            log.audit('PAYMENTS REPORT START', `Deployment: ${script.deploymentId} | url set: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'} | folderId: ${folderId} | todayParam: ${todayParam || '(not set)'}`);
+            log.audit('B2B PAYMENTS REPORT START', `Deployment: ${script.deploymentId} | url set: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'} | folderId: ${folderId} | todayParam: ${todayParam || '(not set)'}`);
 
             const today = resolveToday(todayParam);
-            log.debug('PAYMENTS REPORT TODAY RESOLVED', `Today: ${fmtYYYYMMDD(today)} (day of month: ${today.getDate()})`);
+            log.debug('B2B PAYMENTS REPORT TODAY RESOLVED', `Today: ${fmtYYYYMMDD(today)} (day of month: ${today.getDate()})`);
 
             const window = resolveWindow(today);
             if (!window) {
-                log.audit('PAYMENTS REPORT SKIPPED', `Today (${fmtYYYYMMDD(today)}) is not the 1st, 11th or 21st — nothing to run`);
+                log.audit('B2B PAYMENTS REPORT SKIPPED', `Today (${fmtYYYYMMDD(today)}) is not the 1st, 11th or 21st — nothing to run`);
                 return;
             }
-            log.audit('PAYMENTS REPORT WINDOW', `Today: ${fmtYYYYMMDD(today)} | Window: ${fmtYYYYMMDD(window.start)} - ${fmtYYYYMMDD(window.end)}`);
+            log.audit('B2B PAYMENTS REPORT WINDOW', `Today: ${fmtYYYYMMDD(today)} | Window: ${fmtYYYYMMDD(window.start)} - ${fmtYYYYMMDD(window.end)}`);
 
-            log.audit('PAYMENTS REPORT SEARCH START', `Search: ${SEARCH_ID} | Filter trandate within: ${toFilterDate(window.start)} - ${toFilterDate(window.end)}`);
+            log.audit('B2B PAYMENTS REPORT SEARCH START', `Search: ${SEARCH_ID} | Filter trandate within: ${toFilterDate(window.start)} - ${toFilterDate(window.end)}`);
             const payments = runSearch(window);
-            log.audit('PAYMENTS REPORT SEARCH RESULTS', `Rows returned: ${payments.length}`);
+            log.audit('B2B PAYMENTS REPORT SEARCH RESULTS', `Rows returned: ${payments.length}`);
             if (payments.length === 0) {
-                log.audit('PAYMENTS REPORT SKIPPED', `No results for window ${fmtYYYYMMDD(window.start)} - ${fmtYYYYMMDD(window.end)}`);
+                log.audit('B2B PAYMENTS REPORT SKIPPED', `No results for window ${fmtYYYYMMDD(window.start)} - ${fmtYYYYMMDD(window.end)}`);
                 return;
             }
-            payments.forEach((p, i) => log.debug('PAYMENTS REPORT ROW', `#${i + 1} | Date: ${p.date} | TaxPercent: ${p.taxPercent} | Currency: ${p.currencyCode} | Amount: ${p.amount}`));
+            payments.forEach((p, i) => log.debug('B2B PAYMENTS REPORT ROW', `#${i + 1} | Invoice: ${p.invoiceId} | IssueDate: ${p.issueDate} | Date: ${p.date} | TaxPercent: ${p.taxPercent} | Currency: ${p.currencyCode} | Amount: ${p.amount}`));
 
             const rptId = `RPT-${today.getFullYear()}-${pad2(today.getDate())}${pad2(today.getMonth() + 1)}`;
-            log.audit('PAYMENTS REPORT ID', `RPT ID: ${rptId}`);
+            log.audit('B2B PAYMENTS REPORT ID', `RPT ID: ${rptId}`);
 
             const xml = buildReportXml(rptId, payments);
-            log.debug('PAYMENTS REPORT XML BUILT', `Length: ${xml.length} chars`);
+            log.debug('B2B PAYMENTS REPORT XML BUILT', `Length: ${xml.length} chars`);
 
-            const fileName = `${fmtYYYYMMDD(today)}_PaymentsReport_${rptId}.xml`;
-            log.audit('PAYMENTS REPORT FILE SAVING', `File: ${fileName} | Folder: ${folderId}`);
+            const fileName = `${fmtYYYYMMDD(today)}_B2BPaymentsReport_${rptId}.xml`;
+            log.audit('B2B PAYMENTS REPORT FILE SAVING', `File: ${fileName} | Folder: ${folderId}`);
             const xmlFile = file.create({
                 name:     fileName,
                 fileType: file.Type.XMLDOC,
@@ -102,12 +104,12 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
                 folder:   folderId
             });
             const fileId = xmlFile.save();
-            log.audit('PAYMENTS REPORT FILE SAVED', `File: ${fileName} | File ID: ${fileId}`);
+            log.audit('B2B PAYMENTS REPORT FILE SAVED', `File: ${fileName} | File ID: ${fileId}`);
 
             if (apiUrl && oauthConfigured && apiDocType) {
                 try {
                     const bearerToken = getBearerToken(tokenUrl, clientId, clientSecret, scope);
-                    log.audit('PAYMENTS REPORT API CALLING', `POST ${apiUrl}`);
+                    log.audit('B2B PAYMENTS REPORT API CALLING', `POST ${apiUrl}`);
                     const response = https.post({
                         url:  apiUrl,
                         body: xml,
@@ -118,26 +120,26 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
                         }
                     });
                     if (response.code >= 200 && response.code < 300) {
-                        log.audit('PAYMENTS REPORT API SENT', `Status: ${response.code}`);
+                        log.audit('B2B PAYMENTS REPORT API SENT', `Status: ${response.code}`);
                     } else {
-                        log.error('PAYMENTS REPORT API FAILED', `Status: ${response.code} | Body: ${response.body}`);
+                        log.error('B2B PAYMENTS REPORT API FAILED', `Status: ${response.code} | Body: ${response.body}`);
                     }
                 } catch (apiErr) {
-                    log.error('PAYMENTS REPORT API FAILED', `Name: ${apiErr.name} | Message: ${apiErr.message} | Stack: ${apiErr.stack}`);
+                    log.error('B2B PAYMENTS REPORT API FAILED', `Name: ${apiErr.name} | Message: ${apiErr.message} | Stack: ${apiErr.stack}`);
                 }
             } else {
-                log.error('PAYMENTS REPORT API SKIPPED', `Missing parameters — url: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${!!apiDocType}`);
+                log.error('B2B PAYMENTS REPORT API SKIPPED', `Missing parameters — url: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${!!apiDocType}`);
             }
 
-            log.audit('PAYMENTS REPORT COMPLETE', `RPT ID: ${rptId} | File ID: ${fileId} | Payments: ${payments.length}`);
+            log.audit('B2B PAYMENTS REPORT COMPLETE', `RPT ID: ${rptId} | File ID: ${fileId} | Invoices: ${payments.length}`);
 
         } catch (e) {
-            log.error('PAYMENTS REPORT FAILED', `${e.message}\n${e.stack}`);
+            log.error('B2B PAYMENTS REPORT FAILED', `${e.message}\n${e.stack}`);
         }
     }
 
     // ── date / window helpers ────────────────────────────────────────────────
-    // custscript_pret_today_pr is a Date-type parameter, so NetSuite hands back a Date object
+    // custscript_pret_today_b2b is a Date-type parameter, so NetSuite hands back a Date object
     // directly. The string-parse branch is a defensive fallback in case it's ever redefined as text.
     function resolveToday(todayParam) {
         if (todayParam instanceof Date) return todayParam;
@@ -145,7 +147,7 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
             try {
                 return format.parse({ value: todayParam, type: format.Type.DATE });
             } catch (e) {
-                log.error('PAYMENTS REPORT TODAY PARAM INVALID', `Value: ${todayParam} | ${e.message} — falling back to real today`);
+                log.error('B2B PAYMENTS REPORT TODAY PARAM INVALID', `Value: ${todayParam} | ${e.message} — falling back to real today`);
             }
         }
         return new Date();
@@ -200,23 +202,25 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
 
         const labelMap = {};
         loadedSearch.columns.forEach(col => { if (col.label) labelMap[col.label] = col; });
-        log.debug('PAYMENTS REPORT SEARCH COLUMNS', `Labels found: ${Object.keys(labelMap).join(', ')}`);
+        log.debug('B2B PAYMENTS REPORT SEARCH COLUMNS', `Labels found: ${Object.keys(labelMap).join(', ')}`);
 
-        const required = ['StartDate', 'EndDate', 'PaymentDate', 'TaxRate', 'CurrencyCode', 'Amount'];
+        const required = ['StartDate', 'EndDate', 'InvoiceID', 'IssueDate', 'PaymentDate', 'TaxRate', 'CurrencyCode', 'Amount'];
         for (const label of required) {
             if (!labelMap[label]) throw new Error(`Saved search ${SEARCH_ID} is missing a column labeled "${label}"`);
         }
 
         const payments = [];
         const pagedData = loadedSearch.runPaged({ pageSize: 1000 });
-        log.debug('PAYMENTS REPORT SEARCH PAGED', `Total pages: ${pagedData.pageRanges.length} | Total count reported: ${pagedData.count}`);
+        log.debug('B2B PAYMENTS REPORT SEARCH PAGED', `Total pages: ${pagedData.pageRanges.length} | Total count reported: ${pagedData.count}`);
         for (let p = 0; p < pagedData.pageRanges.length; p++) {
             const page = pagedData.fetch({ index: p });
-            log.debug('PAYMENTS REPORT PAGE FETCHED', `Page: ${p + 1}/${pagedData.pageRanges.length} | Rows: ${page.data.length}`);
+            log.debug('B2B PAYMENTS REPORT PAGE FETCHED', `Page: ${p + 1}/${pagedData.pageRanges.length} | Rows: ${page.data.length}`);
             page.data.forEach(row => {
                 payments.push({
                     reportStartDate: searchDateToYYYYMMDD(row.getValue(labelMap.StartDate)),
                     reportEndDate:   searchDateToYYYYMMDD(row.getValue(labelMap.EndDate)),
+                    invoiceId:       row.getText(labelMap.InvoiceID) || row.getValue(labelMap.InvoiceID),
+                    issueDate:       searchDateToYYYYMMDD(row.getValue(labelMap.IssueDate)),
                     date:            searchDateToYYYYMMDD(row.getValue(labelMap.PaymentDate)),
                     taxPercent:      cleanNumber(row.getValue(labelMap.TaxRate)),
                     currencyCode:    row.getText(labelMap.CurrencyCode) || row.getValue(labelMap.CurrencyCode),
@@ -265,9 +269,12 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
     function buildReportXml(rptId, payments) {
         const first = payments[0];
 
-        let transactionsXml = '';
+        let invoicesXml = '';
         payments.forEach(p => {
-            transactionsXml += `
+            invoicesXml += `
+        <Invoice>
+            <InvoiceID>${esc(p.invoiceId)}</InvoiceID>
+            <IssueDate>${p.issueDate}</IssueDate>
             <Payment>
                 <Date>${p.date}</Date>
                 <SubTotals>
@@ -275,14 +282,15 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
                     <CurrencyCode>${esc(p.currencyCode)}</CurrencyCode>
                     <Amount>${p.amount}</Amount>
                 </SubTotals>
-            </Payment>`;
+            </Payment>
+        </Invoice>`;
         });
 
         return `<?xml version="1.0" encoding="UTF-8"?>
 <Report>
     <ReportDocument>
         <Id>${esc(rptId)}</Id>
-        <Name>Payments Report</Name>
+        <Name>Quarterly Invoice Payments Report</Name>
         <IssueDateTime>
             <DateTimeString>${nowTimestamp()}</DateTimeString>
         </IssueDateTime>
@@ -310,9 +318,7 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
         <ReportPeriod>
             <StartDate>${first.reportStartDate}</StartDate>
             <EndDate>${first.reportEndDate}</EndDate>
-        </ReportPeriod>
-        <Transactions>${transactionsXml}
-        </Transactions>
+        </ReportPeriod>${invoicesXml}
     </PaymentsReport>
 </Report>`;
     }
