@@ -1,0 +1,217 @@
+{
+    "bumId": "8b7d89cd-b1bb-4f5c-90f0-ca2682405f1f",
+    "fileRefs": [
+        {
+            "refId": "4df300ea6b0711f18918f73d",
+            "fileType": "imageFile"
+        }
+    ],
+    "links": [
+        {
+            "rel": "file",
+            "href": "https://test-api.basware.com/v2/files/4df300ea6b0711f18918f73d",
+            "method": "GET"
+        }
+    ],
+    "origin": {
+        "source": "SendingCustomer",
+        "sourceContentCategory": "StructuredData",
+        "sourceChannelCategory": "Electronic",
+        "processQualityIndicators": [
+            "StructuralValidation"
+        ]
+    },
+    "data": {
+        "externalDocumentIdentifier": {
+            "id": "PRETRECEIVINGTEST"
+        },
+        "issueDate": "2026-02-01",
+        "documentCurrencyCode": "EUR",
+        "note": "AVISLIVRAISON_001",
+        "isIssuedAgainstOrder": false,
+        "accountingSupplierParty": {
+            "endpoint": {
+                "id": "784512968",
+                "schemeId": "UNKNOWN"
+            },
+            "partyIdentifications": [
+                {
+                    "id": "78451296875008",
+                    "schemeId": "FR:SIRET"
+                }
+            ],
+            "partyName": "Pret Dummy Supplier",
+            "postalAddress": {
+                "cityName": "PARIS",
+                "postalZone": "75008",
+                "addressLine": "106 RUE LA BOETIE",
+                "countryId": "FR"
+            },
+            "partyTaxScheme": {
+                "company": {
+                    "id": "FR11223344556",
+                    "schemeId": "VAT"
+                }
+            },
+            "contact": {
+                "name": "Pret Dummy Supplier - AP Contact",
+                "telephone": "01 44 43 44 45",
+                "electronicMail": "radoslav.penov@pret.com"
+            }
+        },
+        "accountingCustomerParty": {
+            "endpoint": {
+                "id": "533214003",
+                "schemeId": "UNKNOWN"
+            },
+            "partyIdentifications": [
+                {
+                    "id": "533214003"
+                }
+            ],
+            "partyName": "Prettest",
+            "postalAddress": {
+                "cityName": "NANTERRE",
+                "postalZone": "92000",
+                "addressLine": "RUE",
+                "countryId": "FR"
+            },
+            "partyTaxScheme": {
+                "company": {
+                    "id": "533214003",
+                    "schemeId": "VAT"
+                }
+            },
+            "contact": {
+                "name": "Contact ACHETEUR(DEP COMPTAFOUR)",
+                "telephone": "01 01 25 45 87",
+                "electronicMail": "contact@acheteur.test"
+            }
+        },
+        "delivery": {
+            "actualDeliveryDate": "2026-01-31"
+        },
+        "deliveryParty": {
+            "partyName": "NOM LIVRé"
+        },
+        "paymentMeans": {
+            "paymentMeansCode": "30",
+            "paymentDueDate": "2026-03-01",
+            "paymentIdentifier": {},
+            "financialAccounts": [
+                {
+                    "financialInstitutionName": "MON COMPTE BANCAIRE",
+                    "financialInstitutionId": "CIC",
+                    "financialInstitutionIdSchemeId": "BIC",
+                    "ids": [
+                        {
+                            "id": "FR8830003000702233935677L21",
+                            "schemeId": "IBAN"
+                        }
+                    ],
+                    "accounting": {
+                        "virtualBankBarcode": {}
+                    }
+                }
+            ]
+        },
+        "paymentTerms": {
+            "settlementPeriod": {},
+            "note": "PAIEMENT 30 JOURS NET"
+        },
+        "taxTotal": {
+            "currencyId": "EUR",
+            "amount": 0.0,
+            "taxSubtotals": [
+                {
+                    "currencyId": "EUR",
+                    "amount": 0.0,
+                    "percent": 0.0,
+                    "taxableAmount": 10000.0,
+                    "taxCategory": {
+                        "id": "Z"
+                    }
+                }
+            ]
+        },
+        "legalMonetaryTotal": {
+            "lineExtensionAmount": {
+                "currencyId": "EUR",
+                "amount": 10000.0
+            },
+            "payableAmount": {
+                "currencyId": "EUR",
+                "amount": 10000.0
+            }
+        },
+        "buyerReference": {
+            "id": "SERVEXEC"
+        },
+        "customFields": [
+            {
+                "name": "exchangeRate",
+                "value": ""
+            },
+            {
+                "name": "transDocNo",
+                "value": "BON_RECEPT_001"
+            },
+            {
+                "name": "projectNumber",
+                "value": "PROJET_0001"
+            },
+            {
+                "name": "PL-WZNumber",
+                "value": "AVISLIVRAISON_001"
+            },
+            {
+                "name": "PMT",
+                "value": "Indemnité forfaitaire pour frais de recouvrement en cas de retard de paiement : 40 €."
+            },
+            {
+                "name": "BW-0000160",
+                "value": "PRIVATE_ID_DELIVERY"
+            },
+            {
+                "name": "DueDate",
+                "value": "2026-03-01"
+            },
+            {
+                "name": "InvoicePeriod_DescriptionCode",
+                "value": "3"
+            },
+            {
+                "name": "documentTypeCode",
+                "value": "380"
+            }
+        ],
+        "invoiceLines": [
+            {
+                "id": "001",
+                "quantity": {
+                    "amount": 1.0,
+                    "unitCode": "ZZ"
+                },
+                "item": {
+                    "description": [
+                        "Uniforms"
+                    ],
+                    "name": "Uniforms",
+                    "sellersItem": {
+                        "id": "Uniforms"
+                    }
+                },
+                "price": {
+                    "amount": 10000.0,
+                    "currencyId": "EUR"
+                },
+                "customFields": [
+                    {
+                        "name": "supplierUnitOfMeasure",
+                        "value": "ZZ"
+                    }
+                ]
+            }
+        ]
+    }
+}
