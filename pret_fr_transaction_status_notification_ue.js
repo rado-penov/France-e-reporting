@@ -3,23 +3,32 @@
  * @NScriptType UserEventScript
  *
  * Sends approval / rejection notifications to Basware when the Document Status of a
- * French Vendor Bill or Vendor Credit changes on edit.
+ * French Vendor Bill or Vendor Credit changes on edit, or is already Open/Rejected
+ * at creation for records created via the UI.
  *
  * Rules:
  * - Subsidiary must be France (internal id 16).
- * - Bills created by the AP RESTlet notify on Open and Rejected.
- * - Bills created any other way (UI) notify on Open only.
+ * - Bills created by the AP RESTlet notify on Open and Rejected (edit only — RESTlet
+ *   creates are skipped on create; the first status-changing edit picks them up).
+ * - Bills created any other way (UI) notify on Open only, on both create and edit.
  * - Vendor Credits follow the same subsidiary rule and notify on Open and Rejected.
+ * - On create, notifications only fire for UI-created records; RESTlet-created
+ *   records are skipped on create.
  *
- * Create context is derived from custbody_pret_ubl_export_ready: pret_fr_ebilling_ue.js
- * sets it on UI-created bills and skips RESTlet context entirely, while
- * pret_fr_ap_vendorbill_rl.js sets only custbody_pret_uuid. So the flag being true
- * means the bill came in through the UI.
+ * UI-created vs RESTlet-created is derived from custbody_pret_ubl_export_ready:
+ * pret_fr_ebilling_ue.js / pret_fr_evendorcredit_ue.js set it on UI-created records,
+ * while pret_fr_ap_vendorbill_rl.js sets only custbody_pret_uuid. So the flag being
+ * true means the record came in through the UI.
  *
- * Deploy on Vendor Bill and Vendor Credit.
+ * Deploy on Vendor Bill and Vendor Credit. Leave the deployment's Event Type field
+ * blank so it defers to the Create/Edit/XEdit handling below.
+ *
+ * Record data is read with record.load() rather than search.lookupFields(): the
+ * search index can lag behind the record store right after a create/edit, which
+ * previously caused this script to read a stale pre-save Document Status.
  */
-define(['N/search', 'N/https', 'N/runtime', 'N/log'],
-(search, https, runtime, log) => {
+define(['N/record', 'N/https', 'N/runtime', 'N/log'],
+(record, https, runtime, log) => {
 
     const API_URL_PARAM = 'custscript_pret_api_url_tsn';
     const TOKEN_URL_PARAM = 'custscript_pret_oauth_token_url_tsn';
@@ -48,9 +57,10 @@ define(['N/search', 'N/https', 'N/runtime', 'N/log'],
         log.audit('STATUS NOTIFICATION START', `type: ${context.type} | record: ${recordType} | id: ${transactionId}`);
 
         try {
-            if (context.type !== context.UserEventType.EDIT &&
+            if (context.type !== context.UserEventType.CREATE &&
+                context.type !== context.UserEventType.EDIT &&
                 context.type !== context.UserEventType.XEDIT) {
-                log.audit('STATUS NOTIFICATION SKIPPED', `Event type is "${context.type}", expected edit or xedit`);
+                log.audit('STATUS NOTIFICATION SKIPPED', `Event type is "${context.type}", expected create, edit or xedit`);
                 return;
             }
 
@@ -63,6 +73,13 @@ define(['N/search', 'N/https', 'N/runtime', 'N/log'],
             }
 
             log.audit('STATUS NOTIFICATION RECORD', JSON.stringify(details));
+
+            const createdViaUi = details.ublExportReady === true;
+
+            if (context.type === context.UserEventType.CREATE && !createdViaUi) {
+                log.audit('STATUS NOTIFICATION SKIPPED', 'Create event was not created via the UI (e.g. AP RESTlet) — notifications only fire on create for UI-created records');
+                return;
+            }
 
             const oldStatus = normalizeStatusValue(readRecordStatus(context.oldRecord));
             const newStatus = normalizeStatusValue(details.statusText || details.statusValue);
@@ -85,8 +102,6 @@ define(['N/search', 'N/https', 'N/runtime', 'N/log'],
                 log.audit('STATUS NOTIFICATION SKIPPED', `Subsidiary is ${details.subsidiaryId || '(none)'}, expected ${FRANCE_SUBSIDIARY_ID} (France)`);
                 return;
             }
-
-            const createdViaUi = details.ublExportReady === true;
 
             if (recordType === 'vendorbill' && createdViaUi && newStatus !== 'open') {
                 log.audit('STATUS NOTIFICATION SKIPPED', `UI-created vendor bill set to "${newStatus}" — only Open is notified`);
@@ -131,24 +146,20 @@ define(['N/search', 'N/https', 'N/runtime', 'N/log'],
         if (!recordType || !transactionId) return null;
 
         try {
-            const columns = ['subsidiary', 'status', 'tranid', UUID_FIELD, APPROVAL_NOTES_FIELD];
-            if (recordType === 'vendorbill') columns.push(UBL_EXPORT_READY_FIELD);
-
-            const values = search.lookupFields({
+            const rec = record.load({
                 type: recordType,
                 id: transactionId,
-                columns: columns
+                isDynamic: false
             });
 
-            const subsidiary = values.subsidiary;
             return {
-                subsidiaryId: (subsidiary && subsidiary.length) ? String(subsidiary[0].value) : '',
-                statusValue: firstValue(values.status, 'value'),
-                statusText: firstValue(values.status, 'text'),
-                tranId: values.tranid || '',
-                uuid: values[UUID_FIELD] || '',
-                approvalNotes: values[APPROVAL_NOTES_FIELD] || '',
-                ublExportReady: values[UBL_EXPORT_READY_FIELD] === true
+                subsidiaryId: String(rec.getValue({ fieldId: 'subsidiary' }) || ''),
+                statusValue: rec.getValue({ fieldId: STATUS_FIELD }) || '',
+                statusText: rec.getText({ fieldId: STATUS_FIELD }) || '',
+                tranId: rec.getValue({ fieldId: 'tranid' }) || '',
+                uuid: rec.getValue({ fieldId: UUID_FIELD }) || '',
+                approvalNotes: rec.getValue({ fieldId: APPROVAL_NOTES_FIELD }) || '',
+                ublExportReady: rec.getValue({ fieldId: UBL_EXPORT_READY_FIELD }) === true
             };
         } catch (e) {
             log.error('STATUS NOTIFICATION LOOKUP FAILED', `${recordType} | ${transactionId} | ${e.message}`);
@@ -227,13 +238,6 @@ define(['N/search', 'N/https', 'N/runtime', 'N/log'],
 
         log.audit('STATUS NOTIFICATION TOKEN OK', `Status: ${response.code}`);
         return parsed.access_token;
-    }
-
-    // lookupFields returns select fields as [{value, text}] but plain fields as strings.
-    function firstValue(field, prop) {
-        if (!field) return '';
-        if (Array.isArray(field)) return field.length ? String(field[0][prop] || '') : '';
-        return String(field);
     }
 
     function readRecordStatus(rec) {
