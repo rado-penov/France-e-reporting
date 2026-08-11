@@ -4,7 +4,7 @@
  *
  * Sends approval / rejection notifications to Basware when the Document Status of a
  * French Vendor Bill or Vendor Credit changes on edit, or is already Open/Rejected
- * at creation for records created via the UI.
+ * (or Pending Approval, for UI-created records — see below) at creation.
  *
  * Rules:
  * - Subsidiary must be France (internal id 16).
@@ -26,9 +26,18 @@
  * Record data is read with record.load() rather than search.lookupFields(): the
  * search index can lag behind the record store right after a create/edit, which
  * previously caused this script to read a stale pre-save Document Status.
+ *
+ * NetSuite's Bill Approval Routing can auto-approve a UI-created record (Pending
+ * Approval -> Open) through a process that never resubmits the record, so no further
+ * afterSubmit fires for it, and by the time this script runs, record.load() can still
+ * return the pre-approval Document Status (the derived status field lags behind the
+ * System Notes audit trail, which is written as soon as the underlying field changes).
+ * To handle this, on create for a UI-created record this script checks System Notes
+ * for a Document Status change whose OLD value is "Pending Approval"; if found, the
+ * record is treated as Open and notified immediately.
  */
-define(['N/record', 'N/https', 'N/runtime', 'N/log'],
-(record, https, runtime, log) => {
+define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
+(record, search, https, runtime, log) => {
 
     const API_URL_PARAM = 'custscript_pret_api_url_tsn';
     const TOKEN_URL_PARAM = 'custscript_pret_oauth_token_url_tsn';
@@ -40,6 +49,7 @@ define(['N/record', 'N/https', 'N/runtime', 'N/log'],
     const FRANCE_SUBSIDIARY_ID = '16';
     const UUID_FIELD = 'custbody_pret_uuid';
     const UBL_EXPORT_READY_FIELD = 'custbody_pret_ubl_export_ready';
+    const PENDING_APPROVAL_OLD_VALUE = 'Pending Approval';
 
     // TBC: confirm the Document Status field id and that it exposes "Open" / "Rejected"
     const STATUS_FIELD = 'status';
@@ -75,18 +85,35 @@ define(['N/record', 'N/https', 'N/runtime', 'N/log'],
             log.audit('STATUS NOTIFICATION RECORD', JSON.stringify(details));
 
             const createdViaUi = details.ublExportReady === true;
+            const isCreate = context.type === context.UserEventType.CREATE;
 
-            if (context.type === context.UserEventType.CREATE && !createdViaUi) {
+            log.audit('STATUS NOTIFICATION CONTEXT', `isCreate: ${isCreate} | createdViaUi: ${createdViaUi}`);
+
+            if (isCreate && !createdViaUi) {
                 log.audit('STATUS NOTIFICATION SKIPPED', 'Create event was not created via the UI (e.g. AP RESTlet) — notifications only fire on create for UI-created records');
                 return;
             }
 
             const oldStatus = normalizeStatusValue(readRecordStatus(context.oldRecord));
-            const newStatus = normalizeStatusValue(details.statusText || details.statusValue);
+            let newStatus = normalizeStatusValue(details.statusText || details.statusValue);
 
             log.audit('STATUS NOTIFICATION STATUS CHECK',
                 `old: "${oldStatus || '(none)'}" | new: "${newStatus || '(none)'}" | ` +
                 `raw new value: "${details.statusValue}" | raw new text: "${details.statusText}"`);
+
+            if (isCreate && createdViaUi) {
+                const pendingApprovalNote = findPendingApprovalSystemNote(recordType, transactionId);
+                if (pendingApprovalNote) {
+                    log.audit('STATUS NOTIFICATION CREATE PENDING APPROVAL',
+                        `${recordType} ${transactionId} — System Note found: field "${pendingApprovalNote.field}" old value ` +
+                        `"${pendingApprovalNote.oldValue}" -> new value "${pendingApprovalNote.newValue}" ` +
+                        `(set by: ${pendingApprovalNote.setBy}, date: ${pendingApprovalNote.date}) — treating as Open and notifying now`);
+                    newStatus = 'open';
+                } else {
+                    log.audit('STATUS NOTIFICATION CREATE NO SYSTEM NOTE',
+                        `${recordType} ${transactionId} — no System Note found with Document Status old value "${PENDING_APPROVAL_OLD_VALUE}"`);
+                }
+            }
 
             if (oldStatus === newStatus) {
                 log.audit('STATUS NOTIFICATION SKIPPED', 'Document Status did not change');
@@ -135,10 +162,48 @@ define(['N/record', 'N/https', 'N/runtime', 'N/log'],
                 };
             }
 
+            log.audit('STATUS NOTIFICATION PAYLOAD READY', JSON.stringify(payload));
+
             sendNotification(payload);
             log.audit('STATUS NOTIFICATION SENT', JSON.stringify(payload));
         } catch (e) {
             log.error('STATUS NOTIFICATION FAILED', `${e.name}: ${e.message}\n${e.stack}`);
+        }
+    }
+
+    function findPendingApprovalSystemNote(recordType, transactionId) {
+        try {
+            const results = search.create({
+                type: search.Type.SYSTEM_NOTE,
+                filters: [
+                    ['recordid', 'is', transactionId],
+                    'AND',
+                    ['oldvalue', 'is', PENDING_APPROVAL_OLD_VALUE]
+                ],
+                columns: [
+                    search.createColumn({ name: 'field' }),
+                    search.createColumn({ name: 'oldvalue' }),
+                    search.createColumn({ name: 'newvalue' }),
+                    search.createColumn({ name: 'name' }),
+                    search.createColumn({ name: 'date', sort: search.Sort.DESC })
+                ]
+            }).run().getRange({ start: 0, end: 5 });
+
+            log.debug('STATUS NOTIFICATION SYSTEM NOTE SEARCH', `${recordType} ${transactionId} | matches: ${results ? results.length : 0}`);
+
+            if (!results || !results.length) return null;
+
+            const note = results[0];
+            return {
+                field: note.getValue('field') || note.getText('field') || '',
+                oldValue: note.getValue('oldvalue') || '',
+                newValue: note.getValue('newvalue') || '',
+                setBy: note.getText('name') || note.getValue('name') || '',
+                date: note.getValue('date') || ''
+            };
+        } catch (e) {
+            log.error('STATUS NOTIFICATION SYSTEM NOTE SEARCH FAILED', `${recordType} ${transactionId} | ${e.name}: ${e.message}`);
+            return null;
         }
     }
 
