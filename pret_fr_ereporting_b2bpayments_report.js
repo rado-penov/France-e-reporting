@@ -92,10 +92,14 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
             const rptId = `RPT-${today.getFullYear()}-${pad2(today.getDate())}${pad2(today.getMonth() + 1)}`;
             log.audit('B2B PAYMENTS REPORT ID', `RPT ID: ${rptId}`);
 
-            const xml = buildReportXml(rptId, payments);
+            const invoices = groupPaymentsByInvoice(payments);
+            log.debug('B2B PAYMENTS REPORT GROUPED', `Rows: ${payments.length} | Invoice elements: ${invoices.length}`);
+
+            const nowStamp = nowTimestamp();
+            const xml = buildReportXml(rptId, invoices, nowStamp);
             log.debug('B2B PAYMENTS REPORT XML BUILT', `Length: ${xml.length} chars`);
 
-            const fileName = `${fmtYYYYMMDD(today)}_B2BPaymentsReport_${rptId}.xml`;
+            const fileName = `${nowStamp.slice(2, 8)}_B2BPaymentsReport_RPT_${nowStamp.slice(-4)}.xml`;
             log.audit('B2B PAYMENTS REPORT FILE SAVING', `File: ${fileName} | Folder: ${folderId}`);
             const xmlFile = file.create({
                 name:     fileName,
@@ -131,7 +135,7 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
                 log.error('B2B PAYMENTS REPORT API SKIPPED', `Missing parameters — url: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${!!apiDocType}`);
             }
 
-            log.audit('B2B PAYMENTS REPORT COMPLETE', `RPT ID: ${rptId} | File ID: ${fileId} | Invoices: ${payments.length}`);
+            log.audit('B2B PAYMENTS REPORT COMPLETE', `RPT ID: ${rptId} | File ID: ${fileId} | Invoices: ${invoices.length}`);
 
         } catch (e) {
             log.error('B2B PAYMENTS REPORT FAILED', `${e.message}\n${e.stack}`);
@@ -260,28 +264,70 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
             .replace(/'/g, '&apos;');
     }
 
+    // NetSuite's server runtime clock is not guaranteed to be in the account's (or Basware's)
+    // timezone, so new Date().getHours()/getDate() etc. can be off by an hour or land on the
+    // wrong calendar day. Resolve wall-clock time explicitly in Europe/London instead — this
+    // self-corrects for the GMT/BST switch automatically.
     function nowTimestamp() {
-        const d = new Date();
-        return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+        const fmt = new Intl.DateTimeFormat('en-GB', {
+            timeZone: 'Europe/London',
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+        });
+        const parts = {};
+        fmt.formatToParts(new Date()).forEach(p => { parts[p.type] = p.value; });
+        return `${parts.year}${parts.month}${parts.day}${parts.hour}${parts.minute}`;
+    }
+
+    // Groups flat search rows into one entry per (InvoiceID, PaymentDate), each carrying an array
+    // of SubTotals — an invoice/payment can split across multiple tax rates (see B2B-Payments.xml
+    // template, where INV-2025-2001 has both a 20% and a 10% SubTotals under the same Payment).
+    function groupPaymentsByInvoice(payments) {
+        const map = new Map();
+        const order = [];
+        payments.forEach(p => {
+            const key = `${p.invoiceId} ${p.date}`;
+            if (!map.has(key)) {
+                map.set(key, {
+                    reportStartDate: p.reportStartDate,
+                    reportEndDate:   p.reportEndDate,
+                    invoiceId:       p.invoiceId,
+                    issueDate:       p.issueDate,
+                    date:            p.date,
+                    subtotals:       []
+                });
+                order.push(key);
+            }
+            map.get(key).subtotals.push({
+                taxPercent:   p.taxPercent,
+                currencyCode: p.currencyCode,
+                amount:       p.amount
+            });
+        });
+        return order.map(key => map.get(key));
     }
 
     // ── Report XML builder ───────────────────────────────────────────────────
-    function buildReportXml(rptId, payments) {
-        const first = payments[0];
+    function buildReportXml(rptId, invoices, nowStamp) {
+        const first = invoices[0];
 
         let invoicesXml = '';
-        payments.forEach(p => {
+        invoices.forEach(inv => {
+            let subtotalsXml = '';
+            inv.subtotals.forEach(st => {
+                subtotalsXml += `
+                <SubTotals>
+                    <TaxPercent>${st.taxPercent}</TaxPercent>
+                    <CurrencyCode>${esc(st.currencyCode)}</CurrencyCode>
+                    <Amount>${st.amount}</Amount>
+                </SubTotals>`;
+            });
             invoicesXml += `
         <Invoice>
-            <InvoiceID>${esc(p.invoiceId)}</InvoiceID>
-            <IssueDate>${p.issueDate}</IssueDate>
+            <InvoiceID>${esc(inv.invoiceId)}</InvoiceID>
+            <IssueDate>${inv.issueDate}</IssueDate>
             <Payment>
-                <Date>${p.date}</Date>
-                <SubTotals>
-                    <TaxPercent>${p.taxPercent}</TaxPercent>
-                    <CurrencyCode>${esc(p.currencyCode)}</CurrencyCode>
-                    <Amount>${p.amount}</Amount>
-                </SubTotals>
+                <Date>${inv.date}</Date>${subtotalsXml}
             </Payment>
         </Invoice>`;
         });
@@ -292,12 +338,12 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
         <Id>${esc(rptId)}</Id>
         <Name>Quarterly Invoice Payments Report</Name>
         <IssueDateTime>
-            <DateTimeString>${nowTimestamp()}</DateTimeString>
+            <DateTimeString>${nowStamp}</DateTimeString>
         </IssueDateTime>
         <TypeCode>IN</TypeCode>
         <References/>
         <Sender>
-            <Id schemeId="0238">0145</Id>
+            <Id schemeId="0238">1771</Id>
             <Name>Basware Oyj</Name>
             <RoleCode>WK</RoleCode>
             <URIUniversalCommunication>
