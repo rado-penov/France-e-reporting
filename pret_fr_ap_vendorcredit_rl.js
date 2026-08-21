@@ -22,11 +22,13 @@
  * are actually required, or whether a body-level success flag is sufficient.
  *
  * Line coding: lines are built on the 'item' sublist (not 'expense'), with the NetSuite
- * Item resolved by matching data.creditNoteLines[].item's own seller item code against the
- * Item record's `itemid` field. Unlike the vendor bill payload, credit note lines observed so
- * far do not carry an item.sellersItem.id — the resolver checks item.sellersItem.id first (for
- * parity with the vendor bill shape) and falls back to item.name when it's absent (confirmed
- * against the 2026-08-20 sample payload, where lines carry only item.name, e.g. "600021").
+ * Item resolved by matching data.invoiceLines[].item's own seller item code against the
+ * Item record's `itemid` field. Basware sends this document type's lines under the same
+ * `invoiceLines` key as the vendor bill payload (confirmed 2026-08-21), not `creditNoteLines`
+ * as the earlier sample template implied. Unlike the vendor bill payload, credit note lines
+ * observed so far do not carry an item.sellersItem.id — the resolver checks item.sellersItem.id
+ * first (for parity with the vendor bill shape) and falls back to item.name when it's absent
+ * (confirmed against the 2026-08-20 sample payload, where lines carry only item.name, e.g. "600021").
  * Account and tax code are intentionally left unset per line — both default from that resolved
  * item's own settings, same as the vendor bill RESTlet. The AP account on the credit header is
  * likewise never set explicitly; it always defaults to the vendor's payables account.
@@ -122,9 +124,9 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
             credit.setValue(BUM_ID_FIELD, bumId);
             log.audit('AP CREDIT STEP 4 - HEADER SET', `bumId: ${bumId} | vendorId: ${vendorId} | subsidiary: ${subsidiaryId}`);
 
-            const lines = data.creditNoteLines || [];
+            const lines = data.invoiceLines || [];
             if (!lines.length) {
-                return { success: false, bumId, message: 'No creditNoteLines in payload' };
+                return { success: false, bumId, message: 'No invoiceLines in payload' };
             }
 
             for (const line of lines) {
@@ -187,7 +189,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
         if (!body.bumId) return 'Missing bumId';
         if (!body.data) return 'Missing data';
         if (!body.data.accountingSupplierParty) return 'Missing data.accountingSupplierParty';
-        if (!body.data.creditNoteLines || !body.data.creditNoteLines.length) return 'Missing data.creditNoteLines';
+        if (!body.data.invoiceLines || !body.data.invoiceLines.length) return 'Missing data.invoiceLines';
         return null;
     }
 
@@ -481,7 +483,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
     }
 
     // ── Item resolution ──────────────────────────────────────────────────────
-    // Matches creditNoteLines[].item's seller item code against the Item record's own
+    // Matches invoiceLines[].item's seller item code against the Item record's own
     // 'itemid' field. Prefers item.sellersItem.id (matches the vendor bill payload shape);
     // falls back to item.name since observed credit note payloads omit sellersItem entirely.
     function findItemBySellersId(sellersItemId) {
