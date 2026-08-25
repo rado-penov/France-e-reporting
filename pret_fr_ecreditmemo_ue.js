@@ -250,6 +250,19 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
         const originalInvRef = (cm.getText('createdfrom') || '').replace(/^Invoice\s+#?/i, '')
                             || cm.getValue('otherrefnum') || '';
 
+        let originalInvUUID = '';
+        let originalInvDate = '';
+        const originalInvId = cm.getValue('createdfrom');
+        if (originalInvId) {
+            try {
+                const origInv    = record.load({ type: record.Type.INVOICE, id: originalInvId });
+                originalInvUUID  = origInv.getValue('custbody_pret_uuid') || '';
+                originalInvDate  = fmtDate(origInv.getValue('trandate'))  || '';
+            } catch (e) {
+                log.error('UBL ORIG INV LOAD FAILED', `CM: ${cm.getValue('tranid')} | origInvId: ${originalInvId} | ${e.message}`);
+            }
+        }
+
         // ── Accounting period ────────────────────────────────────────────────
         const periodStart = period ? (fmtDate(period.getValue('startdate')) || '') : '';
         const periodEnd   = period ? (fmtDate(period.getValue('enddate'))   || '') : '';
@@ -309,15 +322,16 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
             const itemId  = cm.getSublistValue({ sublistId: 'item', fieldId: 'item',     line: i }) || `NOT_ITEM_LINE${i + 1}`;
             const taxRate = num(cm.getSublistValue({ sublistId: 'item', fieldId: 'taxrate1', line: i }), 1);
             const lineNum = cm.getSublistValue({ sublistId: 'item', fieldId: 'line',     line: i }) || (i + 1);
-            const taxCode = 'S';   // TBC: derive from NetSuite tax code mapping (S/Z/E/AE)
+            const taxCode = parseFloat(taxRate) > 0 ? 'S' : 'Z';
             const uom     = 'EA';  // TBC: derive from NetSuite UOM mapping
 
+            const lineTax = Math.abs(parseFloat(cm.getSublistValue({ sublistId: 'item', fieldId: 'tax1amt', line: i }) || 0));
             lineExtTotal += parseFloat(amount);
 
             const key = `${taxCode}_${taxRate}`;
             if (!taxMap[key]) taxMap[key] = { code: taxCode, rate: taxRate, base: 0, tax: 0 };
             taxMap[key].base += parseFloat(amount);
-            taxMap[key].tax  += parseFloat(amount) * parseFloat(taxRate) / 100;
+            taxMap[key].tax  += lineTax;
 
             // UBL CreditNote uses CreditNoteLine / CreditedQuantity
             linesXml += `
@@ -372,6 +386,8 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
     <cac:BillingReference>
         <cac:InvoiceDocumentReference>
             <cbc:ID>${esc(originalInvRef)}</cbc:ID>
+            ${originalInvUUID ? `<cbc:UUID>${esc(originalInvUUID)}</cbc:UUID>` : ''}
+            ${originalInvDate ? `<cbc:IssueDate>${originalInvDate}</cbc:IssueDate>` : ''}
         </cac:InvoiceDocumentReference>
     </cac:BillingReference>` : '';
 
@@ -419,10 +435,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
     </cac:PaymentTerms>` : '';
 
         // ── Assemble — UBL CreditNote schema ────────────────────────────────
-        return `<?xml version="1.0" encoding="UTF-8"?>
-<CreditNote xmlns="urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2"
-            xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
-            xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+        return `<CreditNote xmlns:xsi="http://pret.com/schemas/credit-memo" xmlns:cbc="https://pret.com/schemas/cbc" xmlns:cac="https://pret.com/schemas/cac">
     <cbc:UBLVersionID>2.1</cbc:UBLVersionID>
     <cbc:CustomizationID>urn:cen.eu:en16931:2017</cbc:CustomizationID>
     <cbc:ProfileID>B1</cbc:ProfileID>
@@ -432,6 +445,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
     <cbc:CreditNoteTypeCode>381</cbc:CreditNoteTypeCode>
     <cbc:Note>#REG#TBC</cbc:Note>
     <cbc:Note>#ABL#TBC</cbc:Note>
+    <cbc:Note>#PMD#TBC</cbc:Note>
     ${memo        ? `<cbc:Note>#AAI#${esc(memo)}</cbc:Note>` : ''}
     ${pmtInfoNote ? `<cbc:Note>#PMT#${esc(pmtInfoNote)}</cbc:Note>` : ''}
     <cbc:Note>#AAB#TBC</cbc:Note>
@@ -497,7 +511,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
         </cac:Party>
     </cac:AccountingCustomerParty>
     <cac:PaymentMeans>
-        <cbc:PaymentMeansCode>${esc(payMeansCode)}</cbc:PaymentMeansCode>
+        <cbc:PaymentMeansCode>ZZZ</cbc:PaymentMeansCode>
         <cac:PayeeFinancialAccount>
             <cbc:ID>${esc(selIBAN)}</cbc:ID>
             <cbc:Name>${esc(selBankName)}</cbc:Name>

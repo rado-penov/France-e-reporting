@@ -34,6 +34,10 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
     const DEFAULT_REJECTION_REASON = 'The transaction has been rejected. Please contact the AP department for more details.';
 
     function post(requestBody) {
+        log.audit('STATUS NOTIFICATION RAW BODY', typeof requestBody === 'string'
+            ? requestBody
+            : JSON.stringify(requestBody));
+
         const body = requestBody || {};
         const transactionId = body.transactionId || body.id || body.recordId;
         const requestedRecordType = normalizeRecordType(body.recordType || body.transactionType || body.type);
@@ -55,6 +59,7 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
 
         try {
             if (context !== 'edit') {
+                log.audit('STATUS NOTIFICATION SKIPPED', `Context is "${context || '(missing)'}", expected "edit"`);
                 return {
                     success: true,
                     message: 'Ignored: not an edit event'
@@ -62,6 +67,7 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
             }
 
             if (!requestedRecordType) {
+                log.error('STATUS NOTIFICATION SKIPPED', 'Missing transaction type in request body');
                 return {
                     success: false,
                     message: 'Missing transaction type'
@@ -79,6 +85,7 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
             }
 
             if (changedField !== 'documentstatus') {
+                log.audit('STATUS NOTIFICATION SKIPPED', `Changed field is "${changedField || '(missing)'}", expected "documentstatus"`);
                 return {
                     success: true,
                     message: 'Ignored: Document Status was not changed'
@@ -86,6 +93,7 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
             }
 
             if (!transactionId) {
+                log.error('STATUS NOTIFICATION SKIPPED', 'Missing transactionId in request body');
                 return {
                     success: false,
                     message: 'Missing transactionId'
@@ -100,8 +108,13 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
                 };
             }
 
+            log.audit('STATUS NOTIFICATION RECORD LOADED', `${requestedRecordType} | id ${transactionId}`);
+
             if (!transactionUuid) {
                 transactionUuid = transaction.getValue({ fieldId: 'custbody_pret_uuid' }) || '';
+                log.audit('STATUS NOTIFICATION UUID', `Read from record: "${transactionUuid || '(empty)'}"`);
+            } else {
+                log.audit('STATUS NOTIFICATION UUID', `Supplied in request: "${transactionUuid}"`);
             }
 
             const documentType = requestedRecordType === 'vendorcredit' ? 'CreditNote' : 'Invoice';
@@ -122,6 +135,7 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
                     rejectionReason: rejectionReason
                 };
             } else {
+                log.audit('STATUS NOTIFICATION SKIPPED', `New value is "${newValue || '(missing)'}", expected "open" or "rejected"`);
                 return {
                     success: true,
                     message: 'Ignored: status change does not require a notification'
@@ -180,11 +194,31 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
         const scope = script.getParameter({ name: SCOPE_PARAM });
         const apiDocType = script.getParameter({ name: DOC_TYPE_PARAM });
 
-        if (!apiUrl || !tokenUrl || !clientId || !clientSecret || !scope || !apiDocType) {
-            throw new Error('Missing posting parameters. Please configure the API URL, OAuth parameters and document type script parameters.');
+        const missing = [
+            [API_URL_PARAM, apiUrl],
+            [TOKEN_URL_PARAM, tokenUrl],
+            [CLIENT_ID_PARAM, clientId],
+            [CLIENT_SECRET_PARAM, clientSecret],
+            [SCOPE_PARAM, scope],
+            [DOC_TYPE_PARAM, apiDocType]
+        ].filter(pair => !pair[1]).map(pair => pair[0]);
+
+        if (missing.length) {
+            log.error('STATUS NOTIFICATION PARAMETERS MISSING', missing.join(', '));
+            throw new Error(`Missing posting parameters: ${missing.join(', ')}`);
         }
 
+        log.audit('STATUS NOTIFICATION PARAMETERS OK', JSON.stringify({
+            apiUrl: apiUrl,
+            tokenUrl: tokenUrl,
+            clientId: clientId,
+            scope: scope,
+            docType: apiDocType
+        }));
+
         const token = getBearerToken(tokenUrl, clientId, clientSecret, scope);
+
+        log.audit('STATUS NOTIFICATION POSTING', `${apiUrl} | ${JSON.stringify(payload)}`);
         const response = https.post({
             url: apiUrl,
             body: JSON.stringify(payload),
@@ -194,6 +228,8 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
                 'X-Pret-Document-Type': apiDocType
             }
         });
+
+        log.audit('STATUS NOTIFICATION API RESPONSE', `Status: ${response.code} | Body: ${response.body}`);
 
         if (response.code < 200 || response.code >= 300) {
             throw new Error(`Notification API returned ${response.code}: ${response.body}`);
@@ -208,6 +244,8 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
     function getBearerToken(tokenUrl, clientId, clientSecret, scope) {
         const body = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}` +
                      `&client_secret=${encodeURIComponent(clientSecret)}&scope=${encodeURIComponent(scope)}`;
+
+        log.audit('STATUS NOTIFICATION TOKEN REQUEST', `${tokenUrl} | client_id: ${clientId} | scope: ${scope}`);
         const response = https.post({
             url: tokenUrl,
             body: body,
@@ -215,8 +253,11 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
         });
 
         if (response.code < 200 || response.code >= 300) {
+            log.error('STATUS NOTIFICATION TOKEN FAILED', `Status: ${response.code} | Body: ${response.body}`);
             throw new Error(`Token request failed — Status: ${response.code} | Body: ${response.body}`);
         }
+
+        log.audit('STATUS NOTIFICATION TOKEN OK', `Status: ${response.code}`);
 
         const parsed = JSON.parse(response.body);
         if (!parsed.access_token) {
@@ -261,5 +302,13 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
         return normalized;
     }
 
-    return { post };
+    function get(requestParams) {
+        log.audit('STATUS NOTIFICATION PING', JSON.stringify(requestParams || {}));
+        return {
+            success: true,
+            message: 'Status notification RESTlet is deployed and reachable'
+        };
+    }
+
+    return { get, post };
 });

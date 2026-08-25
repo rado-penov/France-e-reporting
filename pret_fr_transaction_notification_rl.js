@@ -121,6 +121,9 @@ define(['N/record', 'N/search', 'N/log'],
 
     function findTransactionByUuid(uuid, documentType) {
         const searchConfigs = [];
+        const trimmedUuid = String(uuid || '').trim();
+
+        log.debug('TRANSACTION NOTIFICATION SEARCH DEBUG', `uuid: ${trimmedUuid} | documentType: ${documentType || ''}`);
 
         if (!documentType || documentType === 'invoice') {
             searchConfigs.push({
@@ -150,20 +153,40 @@ define(['N/record', 'N/search', 'N/log'],
         }
 
         for (const config of searchConfigs) {
-            const results = search.create({
+            const exactResults = search.create({
                 type: config.type,
-                filters: [[UUID_FIELD, 'is', uuid]],
-                columns: ['internalid']
-            }).run().getRange({ start: 0, end: 1 });
+                filters: [[UUID_FIELD, search.Operator.IS, trimmedUuid]],
+                columns: ['internalid', UUID_FIELD]
+            }).run().getRange({ start: 0, end: 5 });
 
-            if (results && results.length) {
+            if (exactResults && exactResults.length) {
+                const matchedId = exactResults[0].getValue('internalid');
+                const matchedUuid = exactResults[0].getValue(UUID_FIELD);
+                log.debug('TRANSACTION NOTIFICATION SEARCH MATCH', `recordType: ${config.recordType} | internalId: ${matchedId} | storedUuid: ${matchedUuid}`);
                 return {
                     type: config.recordType,
-                    id: results[0].getValue('internalid')
+                    id: matchedId
+                };
+            }
+
+            const containsResults = search.create({
+                type: config.type,
+                filters: [[UUID_FIELD, search.Operator.CONTAINS, trimmedUuid]],
+                columns: ['internalid', UUID_FIELD]
+            }).run().getRange({ start: 0, end: 5 });
+
+            if (containsResults && containsResults.length) {
+                const matchedId = containsResults[0].getValue('internalid');
+                const matchedUuid = containsResults[0].getValue(UUID_FIELD);
+                log.debug('TRANSACTION NOTIFICATION SEARCH MATCH (CONTAINS)', `recordType: ${config.recordType} | internalId: ${matchedId} | storedUuid: ${matchedUuid}`);
+                return {
+                    type: config.recordType,
+                    id: matchedId
                 };
             }
         }
 
+        log.audit('TRANSACTION NOTIFICATION SEARCH NO MATCH', `uuid: ${trimmedUuid} | documentType: ${documentType || ''}`);
         return null;
     }
 

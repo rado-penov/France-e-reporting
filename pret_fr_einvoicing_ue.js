@@ -40,7 +40,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
             // Only process French invoices (FR subsidiary ID=16 or billing country = FR)
             const isFrSubsidiary  = String(inv.getValue('subsidiary')) === '16';
             const isFrBillCountry = inv.getValue('billcountry') === 'FR';
-            if (!isFrSubsidiary && !isFrBillCountry) return;
+            if (!isFrSubsidiary || !isFrBillCountry) return;
 
             const sub  = record.load({ type: 'subsidiary', id: inv.getValue('subsidiary') });
             const cust = record.load({ type: record.Type.CUSTOMER, id: inv.getValue('entity') });
@@ -260,15 +260,16 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
             const itemId       = inv.getSublistValue({ sublistId: 'item', fieldId: 'item',                      line: i }) || `NOT_ITEM_LINE${i + 1}`;
             const taxRate      = num(inv.getSublistValue({ sublistId: 'item', fieldId: 'taxrate1',              line: i }), 1);
             const lineNum      = inv.getSublistValue({ sublistId: 'item', fieldId: 'line',                      line: i }) || (i + 1);
-            const taxCode = 'S';   // TBC: derive from NetSuite tax code mapping (S/Z/E/AE)
+            const taxCode = parseFloat(taxRate) > 0 ? 'S' : 'Z';   // TBC: E/AE (exempt/reverse charge) not yet derived
             const uom     = 'EA';  // TBC: derive from NetSuite UOM mapping
 
+            const lineTax = parseFloat(inv.getSublistValue({ sublistId: 'item', fieldId: 'tax1amt', line: i }) || 0);
             lineExtTotal += parseFloat(amount);
 
             const key = `${taxCode}_${taxRate}`;
             if (!taxMap[key]) taxMap[key] = { code: taxCode, rate: taxRate, base: 0, tax: 0 };
             taxMap[key].base += parseFloat(amount);
-            taxMap[key].tax  += parseFloat(amount) * parseFloat(taxRate) / 100;
+            taxMap[key].tax  += lineTax;
 
             linesXml += `
     <cac:InvoiceLine>
@@ -309,9 +310,9 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
         }
 
         // ── Monetary totals ──────────────────────────────────────────────────
-        const subtotal  = num(inv.getValue('subtotal'));
-        const total     = num(inv.getValue('total'));
-        const amountDue = num(inv.getValue('amountdue'));
+        const subtotal        = num(inv.getValue('subtotal'));
+        const total           = num(inv.getValue('total'));
+        const amountRemaining = num(inv.getValue('amountremaining'));
 
         // ── Optional XML blocks ──────────────────────────────────────────────
         const periodBlock = (periodStart && periodEnd) ? `
@@ -380,10 +381,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
     </cac:PaymentTerms>` : '';
 
         // ── Assemble ─────────────────────────────────────────────────────────
-        return `<?xml version="1.0" encoding="UTF-8"?>
-<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
-         xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
-         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+        return `<Invoice xmlns:xsi="http://pret.com/schemas/invoice" xmlns:cbc="https://pret.com/schemas/cbc" xmlns:cac="https://pret.com/schemas/cac">
     <cbc:UBLVersionID>2.1</cbc:UBLVersionID>
     <cbc:CustomizationID>urn:cen.eu:en16931:2017</cbc:CustomizationID>
     <cbc:ProfileID>B1</cbc:ProfileID>
@@ -394,6 +392,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
     <cbc:InvoiceTypeCode>380</cbc:InvoiceTypeCode>
     <cbc:Note>#REG#TBC</cbc:Note>
     <cbc:Note>#ABL#TBC</cbc:Note>
+    <cbc:Note>#PMD#TBC</cbc:Note>
     ${memo        ? `<cbc:Note>#AAI#${esc(memo)}</cbc:Note>` : ''}
     ${pmtInfoNote ? `<cbc:Note>#PMT#${esc(pmtInfoNote)}</cbc:Note>` : ''}
     <cbc:Note>#AAB#TBC</cbc:Note>
@@ -459,7 +458,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
         </cac:Party>
     </cac:AccountingCustomerParty>${deliveryBlock}
     <cac:PaymentMeans>
-        <cbc:PaymentMeansCode>${esc(payMeansCode)}</cbc:PaymentMeansCode>
+        <cbc:PaymentMeansCode>ZZZ</cbc:PaymentMeansCode>
         <cac:PayeeFinancialAccount>
             <cbc:ID>${esc(selIBAN)}</cbc:ID>
             <cbc:Name>${esc(selBankName)}</cbc:Name>
@@ -473,7 +472,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
         <cbc:LineExtensionAmount currencyID="${currency}">${lineExtTotal.toFixed(2)}</cbc:LineExtensionAmount>
         <cbc:TaxExclusiveAmount currencyID="${currency}">${subtotal}</cbc:TaxExclusiveAmount>
         <cbc:TaxInclusiveAmount currencyID="${currency}">${total}</cbc:TaxInclusiveAmount>
-        <cbc:PayableAmount currencyID="${currency}">${amountDue}</cbc:PayableAmount>
+        <cbc:PayableAmount currencyID="${currency}">${amountRemaining}</cbc:PayableAmount>
     </cac:LegalMonetaryTotal>${linesXml}
 </Invoice>`;
     }
