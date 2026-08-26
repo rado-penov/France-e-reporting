@@ -5,53 +5,35 @@
  * Inbound AP JSON -> Vendor Bill RESTlet. Accepts Basware "BUM" JSON (same vendor as the
  * outbound NetSuite -> Basware UBL webhook, opposite direction) and creates a Vendor Bill.
  *
- * Vendor resolution: matched by FR:SIRET (custentity_pret_siret on the Vendor record) —
- * the payload never carries a NetSuite internal ID.
+ * - Vendor resolution: FR:SIRET (custentity_pret_siret) — the payload carries no NetSuite ID.
+ * - Idempotency: bumId matched against BUM_ID_FIELD on the Vendor Bill; a repeat returns the
+ *   existing internal ID instead of duplicating.
+ * - PO-matched (isIssuedAgainstOrder = true): resolves orderReference.id against a PO's tranid
+ *   and builds the bill via record.transform() from that PO, then edits the PO's own lines in
+ *   place (quantity/rate/description from invoiceLines[], matched by orderLineReference or the
+ *   line's own `id`) rather than deleting/recreating them — this is what preserves NetSuite's
+ *   line-level PO linkage (Related Records, poid/podate/poamount). Item is never overridden on a
+ *   matched line — NetSuite rejects an (item, PO) combination that isn't already on the PO — a
+ *   mismatch is logged for manual review instead. If the PO doesn't resolve, this falls back to
+ *   the standalone path rather than failing.
+ * - Standalone (isIssuedAgainstOrder = false): builds the bill with record.create(), lines on the
+ *   'item' sublist resolved via invoiceLines[].item.sellersItem.id against the Item's `itemid`
+ *   (falls back to DEFAULT_ITEM_ID if unmatched). Account/tax code are left to the item's own
+ *   defaults; subsidiary/currency default from the resolved vendor.
+ * - Both paths leave approval status to NetSuite's own routing default.
+ * - Supplier PDF: downloaded from the `links` href (rel='file') after save, filed and attached to
+ *   the bill. Best-effort — a failure is reported but never fails the bill. The href is checked
+ *   against an allowlist (custscript_pret_ap_api_hosts) before credentials are sent to it.
+ * - Response is always HTTP 200 with a body-level { success, internalId, bumId, message }.
  *
- * Idempotency: bumId (top-level UUID on the payload) is matched against BUM_ID_FIELD on
- * the Vendor Bill. A repeat bumId returns the existing internal ID instead of duplicating.
- *
- * PO handling: only the standalone (isIssuedAgainstOrder = false) path is implemented.
- * PO-matched bills are rejected with a not-yet-implemented message pending mapping decisions.
- * Standalone bills are left to NetSuite's own approval routing default (Pending Approval on
- * creation) — this script does not set an approval status field itself.
- *
- * Response contract: always HTTP 200; body is { success, internalId, bumId, message }.
- * TBC — confirm with Basware whether differentiated HTTP status codes per failure type
- * are actually required, or whether a body-level success flag is sufficient.
- *
- * Line coding: lines are built on the 'item' sublist (not 'expense'), with the NetSuite
- * Item resolved by matching data.invoiceLines[].item.sellersItem.id against the Item
- * record's own `itemid` field. Account and tax code are intentionally left unset per line —
- * both default from that resolved item's own settings (confirmed 2026-07-17). The AP account
- * on the bill header is likewise never set explicitly; it always defaults to the vendor's
- * payables account. If a manual tax override is ever needed, the vendor's own `taxitem`
- * field is the fallback — not implemented for now.
- *
- * Source PDF: the payload carries a `links` array; the entry with rel = 'file' is a Basware
- * API URL for the original supplier PDF. After the bill is saved (so the NetSuite tranid
- * exists) the PDF is downloaded with HTTP Basic auth, filed in the File Cabinet as
- * Invoice_<tranid>_<ddmmyyhhmm>.pdf and attached to the bill. This is best-effort: a
- * download failure is logged and reported in the response but never fails the bill.
- *
- * The download URL is NOT a parameter — it arrives in the payload as an absolute href. Because
- * that href decides where the API credentials get sent, it is checked against an allowlist of
- * hosts before the request goes out (custscript_pret_ap_api_hosts).
- *
- * Script parameters (all set on the Script record, valued per deployment):
+ * Script parameters (set on the Script record, valued per deployment):
  *   custscript_pret_ap_pdf_folder    Integer  — File Cabinet folder internal ID
  *   custscript_pret_ap_api_user      Free-Form Text — Basware API username
  *   custscript_pret_ap_api_password  Password — Basware API password
  *   custscript_pret_ap_api_hosts     Free-Form Text — comma-separated allowed hosts for the
- *                                    file link, e.g. 'test-api.basware.com'. Blank = no
- *                                    restriction (logged as a warning).
+ *                                    file link. Blank = no restriction (logged as a warning).
  *
- * TBC / open items (see AP-JSON-to-VendorBill-Integration.md):
- *   - Currency: left to default from the resolved vendor rather than set explicitly from
- *     documentCurrencyCode — TBC whether that ever needs reconciling.
- *   - PDF response encoding: NetSuite returns https.get bodies as strings. toBase64() below
- *     handles both an already-base64 body and a raw '%PDF' body — confirm against the live
- *     Basware endpoint which one it actually sends.
+ * Full history/rationale: AP-JSON-to-VendorBill-Integration.md.
  */
 define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/runtime'],
 (record, search, log, https, file, encode, runtime) => {
@@ -60,6 +42,10 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
     const VENDOR_SIRET_FIELD  = 'custentity_pret_siret';
     const APPROVAL_STATUS_FIELD = 'approvalstatus';
     const PENDING_APPROVAL_VALUE = '1';
+
+    // Fallback used when no NetSuite item matches invoiceLines[].item.sellersItem.id,
+    // so an unmapped item never blocks bill creation.
+    const DEFAULT_ITEM_ID = '35051';
 
     const PARAM_PDF_FOLDER    = 'custscript_pret_ap_pdf_folder';
     const PARAM_API_USER      = 'custscript_pret_ap_api_user';
@@ -86,53 +72,79 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
             }
             log.audit('AP BILL STEP 2 - NOT A DUPLICATE', `bumId: ${bumId}`);
 
-            if (data.isIssuedAgainstOrder) {
-                log.error('AP BILL PO-MATCHED NOT SUPPORTED', `bumId: ${bumId} | orderReference: ${JSON.stringify(data.orderReference || {})}`);
-                return { success: false, bumId, message: 'PO-matched bills are not yet supported by this RESTlet' };
+            const isPoBill = !!data.isIssuedAgainstOrder;
+            let bill, vendorId, subsidiaryId, poId = null;
+
+            if (isPoBill) {
+                const poNumber = data.orderReference && data.orderReference.id;
+                poId = poNumber ? findPurchaseOrderByTranId(poNumber) : null;
+
+                if (!poId) {
+                    log.error('AP BILL PO NOT MATCHING', `bumId: ${bumId} | PO tranid: ${poNumber || '(missing)'} | PO reference is not matching. Please check with the supplier!`);
+                } else {
+                    log.audit('AP BILL STEP 3 - PO RESOLVED', `bumId: ${bumId} | PO tranid: ${poNumber} | poId: ${poId}`);
+                }
             }
 
-            const siret = getSiret(data);
-            if (!siret) {
-                return { success: false, bumId, message: 'No FR:SIRET identification found in accountingSupplierParty.partyIdentifications' };
+            if (poId) {
+                bill = record.transform({
+                    fromType: record.Type.PURCHASE_ORDER,
+                    fromId: poId,
+                    toType: record.Type.VENDOR_BILL,
+                    isDynamic: true
+                });
+                vendorId = bill.getValue('entity');
+                subsidiaryId = bill.getValue('subsidiary');
+
+                // Expense lines (if any) aren't matched against invoiceLines[] below, so they'd
+                // otherwise survive untouched from the PO — drop them. Item lines are handled by
+                // applyInvoiceLinesToPoBill() below, which edits them in place instead of
+                // deleting them outright, to keep their line-level PO linkage intact.
+                removeAllLines(bill, 'expense');
+            } else {
+                const siret = getSiret(data);
+                if (!siret) {
+                    return { success: false, bumId, message: 'No FR:SIRET identification found in accountingSupplierParty.partyIdentifications' };
+                }
+
+                vendorId = findVendorBySiret(siret);
+                if (!vendorId) {
+                    log.error('AP BILL VENDOR NOT FOUND', `bumId: ${bumId} | SIRET: ${siret}`);
+                    return { success: false, bumId, message: `No vendor found for SIRET ${siret}` };
+                }
+                log.audit('AP BILL STEP 3 - VENDOR RESOLVED', `bumId: ${bumId} | SIRET: ${siret} | vendorId: ${vendorId}`);
+
+                const vendor = record.load({ type: record.Type.VENDOR, id: vendorId });
+                subsidiaryId = vendor.getValue('subsidiary');
+
+                bill = record.create({ type: record.Type.VENDOR_BILL, isDynamic: true });
+                bill.setValue('entity', vendorId);
+                if (subsidiaryId) bill.setValue('subsidiary', subsidiaryId);
             }
 
-            const vendorId = findVendorBySiret(siret);
-            if (!vendorId) {
-                log.error('AP BILL VENDOR NOT FOUND', `bumId: ${bumId} | SIRET: ${siret}`);
-                return { success: false, bumId, message: `No vendor found for SIRET ${siret}` };
-            }
-            log.audit('AP BILL STEP 3 - VENDOR RESOLVED', `bumId: ${bumId} | SIRET: ${siret} | vendorId: ${vendorId}`);
-
-            const vendor = record.load({ type: record.Type.VENDOR, id: vendorId });
-            const subsidiaryId = vendor.getValue('subsidiary');
-
-            const bill = record.create({ type: record.Type.VENDOR_BILL, isDynamic: true });
-            bill.setValue('entity', vendorId);
-            if (subsidiaryId) bill.setValue('subsidiary', subsidiaryId);
             if (data.issueDate) bill.setValue('trandate', new Date(data.issueDate));
             bill.setValue('tranid', (data.externalDocumentIdentifier && data.externalDocumentIdentifier.id) || '');
             bill.setValue(BUM_ID_FIELD, bumId);
-            log.audit('AP BILL STEP 4 - HEADER SET', `bumId: ${bumId} | vendorId: ${vendorId} | subsidiary: ${subsidiaryId}`);
+            bill.setValue('externalId', (data.externalDocumentIdentifier && data.externalDocumentIdentifier.id) || '');
+            log.audit('AP BILL STEP 4 - HEADER SET', `bumId: ${bumId} | vendorId: ${vendorId} | subsidiary: ${subsidiaryId} | poMatched: ${!!poId}`);
 
             const lines = data.invoiceLines || [];
             if (!lines.length) {
                 return { success: false, bumId, message: 'No invoiceLines in payload' };
             }
 
-            for (const line of lines) {
-                const qty          = (line.quantity && line.quantity.amount) || 1;
-                const price        = (line.price && line.price.amount) || 0;
-                const sellersItemId = line.item && line.item.sellersItem && line.item.sellersItem.id;
-                if (!sellersItemId) throw new Error(`Line ${line.id || ''} missing item.sellersItem.id`);
-
-                const itemId = findItemBySellersId(sellersItemId);
-                if (!itemId) throw new Error(`No NetSuite item found with itemid ${sellersItemId}`);
-
-                bill.selectNewLine({ sublistId: 'item' });
-                bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item',     value: itemId });
-                bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: qty });
-                bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'rate',     value: price });
-                bill.commitLine({ sublistId: 'item' });
+            if (poId) {
+                applyInvoiceLinesToPoBill(bill, lines, bumId);
+            } else {
+                for (const line of lines) {
+                    const { itemId, qty, price, itemDesc } = resolveInvoiceLine(line, bumId);
+                    bill.selectNewLine({ sublistId: 'item' });
+                    bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item',        value: itemId });
+                    bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity',    value: qty });
+                    bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'rate',        value: price });
+                    if (itemDesc) bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'description', value: itemDesc });
+                    bill.commitLine({ sublistId: 'item' });
+                }
             }
             log.audit('AP BILL STEP 5 - LINES SET', `bumId: ${bumId} | lineCount: ${lines.length}`);
 
@@ -202,6 +214,111 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
             columns: ['internalid']
         }).run().getRange({ start: 0, end: 1 });
         return results.length ? results[0].getValue('internalid') : null;
+    }
+
+    // ── PO resolution (isIssuedAgainstOrder = true) ─────────────────────────
+    function findPurchaseOrderByTranId(tranId) {
+        const results = search.create({
+            type: search.Type.PURCHASE_ORDER,
+            filters: [['tranid', 'is', tranId]],
+            columns: ['internalid']
+        }).run().getRange({ start: 0, end: 1 });
+        return results.length ? results[0].getValue('internalid') : null;
+    }
+
+    // Strips every line from a sublist that record.transform() populated from the source PO —
+    // used only for 'expense' (item lines are handled by applyInvoiceLinesToPoBill instead,
+    // which edits them in place to preserve their line-level PO linkage).
+    function removeAllLines(rec, sublistId) {
+        for (let i = rec.getLineCount({ sublistId }) - 1; i >= 0; i--) {
+            rec.removeLine({ sublistId, line: i });
+        }
+    }
+
+    // Basware's orderLineReference is the UBL-derived equivalent of cac:OrderLineReference/
+    // cbc:LineID — a 1-based line number into the PO this invoice line bills against. Not every
+    // payload includes it though: the live PO-matched test payload (2026-08-26) has no
+    // orderLineReference at all, just a top-level invoiceLines[].id ("1", "2", ...) that plays
+    // the same role — so fall back to that when orderLineReference is absent.
+    function getOrderLineNumber(line) {
+        const ref = line.orderLineReference;
+        const raw = ref ? (ref.lineId != null ? ref.lineId : ref.id) : line.id;
+        const n = parseInt(raw, 10);
+        return Number.isInteger(n) && n > 0 ? n : null;
+    }
+
+    // Resolves the NetSuite item + line values for one invoiceLines[] entry. Shared by both
+    // the standalone (fresh lines) and PO-matched (in-place edit) paths.
+    function resolveInvoiceLine(line, bumId) {
+        const qty          = (line.quantity && line.quantity.amount) || 1;
+        const price        = (line.price && line.price.amount) || 0;
+        const sellersItemId = line.item && line.item.sellersItem && line.item.sellersItem.id;
+        if (!sellersItemId) throw new Error(`Line ${line.id || ''} missing item.sellersItem.id`);
+
+        const itemDesc = (line.item && Array.isArray(line.item.description) && line.item.description.join(' '))
+                      || (line.item && line.item.name)
+                      || '';
+
+        let itemId = findItemBySellersId(sellersItemId);
+        if (!itemId) {
+            log.audit('AP BILL ITEM FALLBACK', `bumId: ${bumId} | No NetSuite item found with itemid ${sellersItemId} — using default item ${DEFAULT_ITEM_ID}`);
+            itemId = DEFAULT_ITEM_ID;
+        }
+
+        return { itemId, qty, price, itemDesc };
+    }
+
+    // Overwrites the PO's own item lines IN PLACE by matching orderLineReference to the PO's
+    // line number — this is what keeps the line-level PO linkage intact (Related Records /
+    // poid-podate-poamount on the printed bill depend on it). Item, quantity, rate and
+    // description are all forced to Basware's values, even where the item differs from what
+    // the PO line originally had (confirmed 2026-08-26). An invoice line with no matching/
+    // in-range orderLineReference is appended as a new, unlinked line. Any PO line Basware
+    // never billed against is removed.
+    function applyInvoiceLinesToPoBill(bill, lines, bumId) {
+        const poLineCount = bill.getLineCount({ sublistId: 'item' });
+        const matchedIndices = new Set();
+
+        for (const line of lines) {
+            const { itemId, qty, price, itemDesc } = resolveInvoiceLine(line, bumId);
+            const lineNumber = getOrderLineNumber(line);
+            const targetIndex = (lineNumber && lineNumber <= poLineCount) ? lineNumber - 1 : null;
+
+            if (targetIndex !== null) {
+                bill.selectLine({ sublistId: 'item', line: targetIndex });
+                matchedIndices.add(targetIndex);
+
+                // NetSuite rejects this outright (YOU_CANNOT_ADD_AN_ITEM_AND_PURCHASE_ORDER_
+                // COMBINATION_THAT_DOES_NOT_EXIST_TO_A_VENDOR_BILL, confirmed 2026-08-26): the
+                // (item, PO) combination on an order-linked line must already exist on the PO
+                // itself, so Basware's item can NOT be forced onto a matched PO line. Leave the
+                // PO's own item as-is here; only quantity/rate/description are overridden. A
+                // mismatch is logged for manual review rather than silently ignored.
+                const poItemId = bill.getCurrentSublistValue({ sublistId: 'item', fieldId: 'item' });
+                if (String(poItemId) !== String(itemId)) {
+                    log.audit('AP BILL PO LINE ITEM MISMATCH',
+                        `bumId: ${bumId} | invoice line ${line.id || ''} resolved to item ${itemId}, but PO line`
+                        + ` ${lineNumber} has item ${poItemId} — keeping the PO's item (NetSuite does not allow`
+                        + ' changing it on an order-linked line); please review manually');
+                }
+            } else {
+                log.audit('AP BILL PO LINE NOT MATCHED',
+                    `bumId: ${bumId} | invoice line ${line.id || ''} has no usable orderLineReference against PO`
+                    + ` (PO has ${poLineCount} line(s)) — adding as a new unlinked line`);
+                bill.selectNewLine({ sublistId: 'item' });
+                bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: itemId });
+            }
+
+            bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity',    value: qty });
+            bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'rate',        value: price });
+            if (itemDesc) bill.setCurrentSublistValue({ sublistId: 'item', fieldId: 'description', value: itemDesc });
+            bill.commitLine({ sublistId: 'item' });
+        }
+
+        // Anything left over on the PO that Basware didn't bill against — drop it.
+        for (let i = poLineCount - 1; i >= 0; i--) {
+            if (!matchedIndices.has(i)) bill.removeLine({ sublistId: 'item', line: i });
+        }
     }
 
     // ── Supplier PDF: download from Basware and file in the File Cabinet ─────

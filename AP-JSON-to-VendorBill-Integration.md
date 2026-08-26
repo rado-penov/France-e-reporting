@@ -100,3 +100,14 @@ Expected result once the RESTlet exists: vendor resolves via SIRET to internal I
 4. **An Item in Sandbox with `itemid = "Uniforms"`** (or whatever code the real test payload uses) — the script resolves `invoiceLines[].item.sellersItem.id` against the Item record's `itemid` field; without a match, bill creation fails.
 5. Deploy the script as a RESTlet (script + deployment record) — no parameters to configure.
 6. Once deployed, Postman needs to hit the RESTlet URL (`https://<account>.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=<id>&deploy=<id>`), not the native `record/v1/vendorBill` endpoint used in the failed test.
+
+## PO-matched path implemented (2026-08-26)
+
+`isIssuedAgainstOrder: true` is now handled, not just rejected. Implementation history/rationale, worked out through live testing against a Sandbox PO (`POFR00019464`):
+
+1. **Initial approach (wrong):** resolve the PO by `tranid`, build via `record.transform()`, then delete all its lines and rebuild fresh from `invoiceLines[]` (same code path as standalone). This saved fine, but the PO then never showed up under the bill's Related Records / `poid`-`podate`-`poamount` — that display is driven by the **line-level** PO linkage, not the header `createdfrom` field, and deleting+recreating lines destroys it.
+2. **Fix:** edit the PO's transformed lines **in place** instead (`selectLine` + `setCurrentSublistValue`, never `removeLine`+`selectNewLine` for a matched line). This is what actually preserves Related Records.
+3. **Line matching:** the UBL-style `orderLineReference.lineId` field this was designed around turned out to be absent from the real test payload — Basware sent a plain top-level `invoiceLines[].id` ("1", "2") instead, playing the same role. The script now checks `orderLineReference` first and falls back to `id`.
+4. **Item override rejected by NetSuite:** the original decision was to force Basware's resolved item onto the matched PO line even if it differed from the PO's own item. Live testing hit `YOU_CANNOT_ADD_AN_ITEM_AND_PURCHASE_ORDER_COMBINATION_THAT_DOES_NOT_EXIST_TO_A_VENDOR_BILL` — NetSuite hard-enforces that an order-linked line's item must already exist on that PO. Reversed: matched lines now only get quantity/rate/description overridden; a mismatched item is logged (`AP BILL PO LINE ITEM MISMATCH`) for manual review instead of applied.
+5. **PO not matching is not a hard failure:** if `orderReference.id` is missing or doesn't resolve to a PO `tranid`, the script logs `PO reference is not matching. Please check with the supplier!` and falls back to the standalone SIRET-based `record.create()` path, rather than rejecting the bill.
+6. **Known caveat, not yet addressed:** none of this updates the PO's own billed-quantity/close tracking — only the line-level linkage needed for display purposes is preserved. Revisit if the PO needs to actually close or reflect billed quantities from this flow.
