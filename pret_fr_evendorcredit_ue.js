@@ -7,6 +7,8 @@
  * on the vendor credit.
  *
  * Fires on CREATE or COPY only. Only processes vendor credits where subsidiary = 16 (France) or vendor country = FR.
+ * Skips execution when the triggering context is RESTlet — vendor credits created by
+ * pret_fr_ap_vendorcredit_rl.js already originated from Basware and must not be exported back to it.
  *
  * Party roles:
  *   AccountingSupplierParty = the Vendor  (issuing the credit note)
@@ -33,6 +35,13 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
 
         if (context.type !== CREATE && context.type !== COPY) {
             log.audit('UBL STEP 1 - SKIPPED', `Only fires on CREATE or COPY, got: ${context.type}`);
+            return;
+        }
+
+        // Vendor credits created by pret_fr_ap_vendorcredit_rl.js (inbound Basware -> NetSuite)
+        // already originated from Basware — they must not be exported back out as UBL.
+        if (execCtx === runtime.ContextType.RESTLET) {
+            log.audit('UBL STEP 1 - SKIPPED', `Created via RESTlet (inbound from Basware) — not exporting, record id: ${context.newRecord.id}`);
             return;
         }
         log.audit('UBL STEP 2 - EVENT TYPE OK', `Processing ${context.type} for record id: ${context.newRecord.id}`);
