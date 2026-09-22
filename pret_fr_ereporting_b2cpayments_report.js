@@ -28,7 +28,9 @@
  *   CurrencyCode  — Currency (grouped)                        → SubTotals/CurrencyCode
  *   Amount        — Amount (summed)                           → SubTotals/Amount
  *
- * Each search result row maps 1:1 to one <Payment> element.
+ * Search result rows are grouped by payment date: each distinct date produces one
+ * <Transactions> block containing a single <Payment>, with one <SubTotals> child per
+ * tax rate recorded on that date.
  *
  * Sender and Issuer blocks use fixed values: Sender is the Basware PDP, Issuer is Pret (France) SAS.
  *
@@ -265,17 +267,38 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
     function buildReportXml(rptId, payments) {
         const first = payments[0];
 
-        let transactionsXml = '';
+        // Group the flat search rows by payment date, preserving the order the rows arrived in.
+        const groups = [];
+        const indexByDate = {};
         payments.forEach(p => {
-            transactionsXml += `
-            <Payment>
-                <Date>${p.date}</Date>
+            let idx = indexByDate[p.date];
+            if (idx === undefined) {
+                idx = groups.length;
+                indexByDate[p.date] = idx;
+                groups.push({ date: p.date, subTotals: [] });
+            }
+            groups[idx].subTotals.push(p);
+        });
+
+        // One <Transactions> block per date, each holding a single <Payment>
+        // with one <SubTotals> per tax rate on that date.
+        let transactionsXml = '';
+        groups.forEach(group => {
+            let subTotalsXml = '';
+            group.subTotals.forEach(p => {
+                subTotalsXml += `
                 <SubTotals>
                     <TaxPercent>${p.taxPercent}</TaxPercent>
                     <CurrencyCode>${esc(p.currencyCode)}</CurrencyCode>
                     <Amount>${p.amount}</Amount>
-                </SubTotals>
-            </Payment>`;
+                </SubTotals>`;
+            });
+            transactionsXml += `
+        <Transactions>
+            <Payment>
+                <Date>${group.date}</Date>${subTotalsXml}
+            </Payment>
+        </Transactions>`;
         });
 
         return `<?xml version="1.0" encoding="UTF-8"?>
@@ -310,9 +333,7 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
         <ReportPeriod>
             <StartDate>${first.reportStartDate}</StartDate>
             <EndDate>${first.reportEndDate}</EndDate>
-        </ReportPeriod>
-        <Transactions>${transactionsXml}
-        </Transactions>
+        </ReportPeriod>${transactionsXml}
     </PaymentsReport>
 </Report>`;
     }
