@@ -115,6 +115,8 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/encode', 'N
                 try {
                     const bearerToken = getBearerToken(tokenUrl, clientId, clientSecret, scope);
                     log.debug('B2B BILLS REPORT TOKEN CLAIMS', describeJwt(bearerToken));
+                    // TEMPORARY — troubleshooting only. Remove once the API call is confirmed working.
+                    log.debug('B2B BILLS REPORT TOKEN RAW', bearerToken);
                     log.audit('B2B BILLS REPORT API CALLING', `POST ${apiUrl}`);
                     const response = https.post({
                         url:  apiUrl,
