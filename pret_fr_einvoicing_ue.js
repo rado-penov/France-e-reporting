@@ -20,8 +20,8 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
 
     // ── afterSubmit ──────────────────────────────────────────────────────────
     function afterSubmit(context) {
-        const { CREATE, COPY } = context.UserEventType;
-        if (context.type !== CREATE && context.type !== COPY) return;
+        const { CREATE, COPY, EDIT } = context.UserEventType;
+        if (context.type !== CREATE && context.type !== COPY && context.type !== EDIT) return; // TEMP: EDIT added for testing — revert before go-live
 
         try {
             const script      = runtime.getCurrentScript();
@@ -39,8 +39,26 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
 
             // Only process French invoices (FR subsidiary ID=16 or billing country = FR)
             const isFrSubsidiary  = String(inv.getValue('subsidiary')) === '16';
-            const isFrBillCountry = inv.getValue('billcountry') === 'FR';
-            if (!isFrSubsidiary || !isFrBillCountry) return;
+
+            // The flattened 'billcountry' body field isn't reliably populated when the account
+            // uses the Address subrecord model (confirmed 2026-08-27: getValue('billcountry')
+            // returned undefined for an invoice whose billingaddress subrecord/native export both
+            // show FR) — fall back to the billingaddress subrecord's own country field.
+            let billCountry = inv.getValue('billcountry');
+            if (!billCountry) {
+                try {
+                    const billAddr = inv.getSubrecord({ fieldId: 'billingaddress' });
+                    billCountry = billAddr ? billAddr.getValue({ fieldId: 'country' }) : billCountry;
+                } catch (e) {
+                    log.audit('UBL BILLING ADDRESS SUBRECORD READ FAILED', `Invoice: ${inv.getValue('tranid')} | ${e.message}`);
+                }
+            }
+            const isFrBillCountry = billCountry === 'FR';
+
+            if (!isFrSubsidiary || !isFrBillCountry) {
+                log.error('UBL ELIGIBILITY CHECK FAILED', `Invoice: ${inv.getValue('tranid')} | subsidiary: "${inv.getValue('subsidiary')}" (isFrSubsidiary: ${isFrSubsidiary}) | billcountry: "${billCountry}" (isFrBillCountry: ${isFrBillCountry})`);
+                return;
+            }
 
             const sub  = record.load({ type: 'subsidiary', id: inv.getValue('subsidiary') });
             const cust = record.load({ type: record.Type.CUSTOMER, id: inv.getValue('entity') });
@@ -188,12 +206,20 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
         const selSiren     = sub.getValue('custrecord_pret_siren')                    || 'NOT_SELLER_SIREN';
         const selSiret     = sub.getValue('custrecord_pret_siret')                    || 'NOT_SELLER_SIRET';
         const selName      = sub.getValue('legalname')                                || 'NOT_SELLER_NAME';
-        const mainAddr     = sub.getSubrecord({ fieldId: 'mainaddress' });
-        const selAddr1     = mainAddr.getValue('addr1')   || 'NOT_SELLER_ADDR1';
-        const selAddr2     = mainAddr.getValue('addr2')   || '';
-        const selCity      = mainAddr.getValue('city')    || 'NOT_SELLER_CITY';
-        const selZip       = mainAddr.getValue('zip')     || 'NOT_SELLER_ZIP';
-        const selCountry   = mainAddr.getValue('country') || sub.getValue('country') || 'NOT_SELLER_COUNTRY';
+        // getSubrecord throws "Field mainaddress is not a subrecord field" when the subsidiary's
+        // main address isn't populated — fall back to the NOT_SELLER_* placeholders in that case,
+        // same defensive pattern as the customer billing address lookup above.
+        let mainAddr = null;
+        try {
+            mainAddr = sub.getSubrecord({ fieldId: 'mainaddress' });
+        } catch (e) {
+            log.audit('UBL SELLER ADDRESS SUBRECORD READ FAILED', `Invoice: ${inv.getValue('tranid')} | Subsidiary: ${sub.id} | ${e.message}`);
+        }
+        const selAddr1     = (mainAddr && mainAddr.getValue('addr1'))   || 'NOT_SELLER_ADDR1';
+        const selAddr2     = (mainAddr && mainAddr.getValue('addr2'))   || '';
+        const selCity      = (mainAddr && mainAddr.getValue('city'))    || 'NOT_SELLER_CITY';
+        const selZip       = (mainAddr && mainAddr.getValue('zip'))     || 'NOT_SELLER_ZIP';
+        const selCountry   = (mainAddr && mainAddr.getValue('country')) || sub.getValue('country') || 'NOT_SELLER_COUNTRY';
         const selVat       = sub.getValue('federalidnumber')                          || 'NOT_SELLER_VAT';
         const selLegalForm = sub.getValue('custrecord_pret_sub_invoice_footer_text')  || 'NOT_SELLER_LEGAL_FORM';
         const selContact   = sub.getValue('legalname')                                || 'NOT_SELLER_CONTACT';
