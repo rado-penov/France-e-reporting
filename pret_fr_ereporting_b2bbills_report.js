@@ -48,8 +48,8 @@
  *                                         date format), so you can simulate the 1st/11th/21st runs.
  *                                         Leave blank in production.
  */
-define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
-(search, file, https, runtime, format, log) => {
+define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/encode', 'N/log'],
+(search, file, https, runtime, format, encode, log) => {
 
     const SEARCH_ID = 'customsearch_pret_france_bills_b2b';
 
@@ -114,6 +114,7 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
             if (apiUrl && oauthConfigured && apiDocType) {
                 try {
                     const bearerToken = getBearerToken(tokenUrl, clientId, clientSecret, scope);
+                    log.debug('B2B BILLS REPORT TOKEN CLAIMS', describeJwt(bearerToken));
                     log.audit('B2B BILLS REPORT API CALLING', `POST ${apiUrl}`);
                     const response = https.post({
                         url:  apiUrl,
@@ -253,6 +254,22 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
         const parsed = JSON.parse(response.body);
         if (!parsed.access_token) throw new Error(`Token response missing access_token — Body: ${response.body}`);
         return parsed.access_token;
+    }
+
+    // Decodes the JWT payload (no signature check) and returns a one-line summary of the claims
+    // an API gateway typically validates. Never logs the token or the secret itself.
+    function describeJwt(token) {
+        try {
+            const parts = String(token || '').split('.');
+            if (parts.length < 2) return `Not a JWT (length ${String(token || '').length})`;
+            let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+            while (b64.length % 4) b64 += '=';
+            const json = encode.convert({ string: b64, inputEncoding: encode.Encoding.BASE_64, outputEncoding: encode.Encoding.UTF_8 });
+            const c = JSON.parse(json);
+            return `aud: ${c.aud} | iss: ${c.iss} | tid: ${c.tid} | appid: ${c.appid || c.azp} | scp: ${c.scp} | roles: ${c.roles} | ver: ${c.ver} | exp: ${c.exp} | token length: ${token.length}`;
+        } catch (e) {
+            return `Could not decode token: ${e.message}`;
+        }
     }
 
     // ── XML helpers ──────────────────────────────────────────────────────────
