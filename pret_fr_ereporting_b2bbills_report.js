@@ -287,7 +287,7 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
         const map = new Map();
         const order = [];
         payments.forEach(p => {
-            const key = `${p.invoiceId} ${p.date}`;
+            const key = `${p.invoiceId} ${p.date}`;
             if (!map.has(key)) {
                 map.set(key, {
                     reportStartDate: p.reportStartDate,
