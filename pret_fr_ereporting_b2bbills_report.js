@@ -354,7 +354,7 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
         <Issuer>
             <Id schemeId="0002">533214003</Id>
             <Name>Pret (France) SAS</Name>
-            <RoleCode>SU</RoleCode>
+            <RoleCode>BY</RoleCode>
             <URIUniversalCommunication>
                 <URIID>pretfranceaccounts@pret.com</URIID>
             </URIUniversalCommunication>
