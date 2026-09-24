@@ -36,14 +36,14 @@
  * Sender and Issuer blocks use fixed values: Sender is the Basware PDP, Issuer is Pret (France) SAS.
  *
  * Script Parameters (defined on the Script record in NetSuite):
- *   custscript_pret_api_url_vb              Free-form text            — API endpoint URL
- *   custscript_pret_oauth_token_url_vb      Free-form text            — OAuth2 token endpoint URL (client_credentials grant)
- *   custscript_pret_oauth_client_id_vb      Free-form text            — OAuth2 client_id
- *   custscript_pret_oauth_client_secret_vb  Free-form Text (Password) — OAuth2 client_secret
- *   custscript_pret_oauth_scope_vb          Free-form text            — OAuth2 scope
- *   custscript_pret_api_doc_type_vb         Free-form text            — Value sent as the X-Pret-Document-Type header
- *   custscript_pret_ubl_folder_vb           Integer                   — File Cabinet folder ID for XML files
- *   custscript_pret_today_vb             Free-form text — TEST ONLY. When set, the script behaves
+ *   custscript_pret_api_url_vbb              Free-form text            — API endpoint URL
+ *   custscript_pret_oauth_token_url_vbb      Free-form text            — OAuth2 token endpoint URL (client_credentials grant)
+ *   custscript_pret_oauth_client_id_vbb      Free-form text            — OAuth2 client_id
+ *   custscript_pret_oauth_client_secret_vbb  Free-form Text (Password) — OAuth2 client_secret
+ *   custscript_pret_oauth_scope_vbb          Free-form text            — OAuth2 scope
+ *   custscript_pret_api_doc_type_vbb         Free-form text            — Value sent as the X-Pret-Document-Type header
+ *   custscript_pret_ubl_folder_vbb           Integer                   — File Cabinet folder ID for XML files
+ *   custscript_pret_today_vbb             Free-form text — TEST ONLY. When set, the script behaves
  *                                         as if "today" were this date (enter in your NetSuite
  *                                         date format), so you can simulate the 1st/11th/21st runs.
  *                                         Leave blank in production.
@@ -57,16 +57,16 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
     function execute(context) {
         try {
             const script      = runtime.getCurrentScript();
-            const apiUrl       = script.getParameter({ name: 'custscript_pret_api_url_vb' });
-            const tokenUrl     = script.getParameter({ name: 'custscript_pret_oauth_token_url_vb' });
-            const clientId     = script.getParameter({ name: 'custscript_pret_oauth_client_id_vb' });
-            const clientSecret = script.getParameter({ name: 'custscript_pret_oauth_client_secret_vb' });
-            const scope        = script.getParameter({ name: 'custscript_pret_oauth_scope_vb' });
-            const apiDocType   = script.getParameter({ name: 'custscript_pret_api_doc_type_vb' });
-            const folderId    = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder_vb' }), 10);
-            const todayParam  = script.getParameter({ name: 'custscript_pret_today_vb' });
+            const apiUrl       = script.getParameter({ name: 'custscript_pret_api_url_vbb' });
+            const tokenUrl     = script.getParameter({ name: 'custscript_pret_oauth_token_url_vbb' });
+            const clientId     = script.getParameter({ name: 'custscript_pret_oauth_client_id_vbb' });
+            const clientSecret = script.getParameter({ name: 'custscript_pret_oauth_client_secret_vbb' });
+            const scope        = script.getParameter({ name: 'custscript_pret_oauth_scope_vbb' });
+            const apiDocType   = script.getParameter({ name: 'custscript_pret_api_doc_type_vbb' });
+            const folderId    = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder_vbb' }), 10);
+            const todayParam  = script.getParameter({ name: 'custscript_pret_today_vbb' });
 
-            if (!folderId || isNaN(folderId)) throw new Error('custscript_pret_ubl_folder_vb parameter is not set on the deployment');
+            if (!folderId || isNaN(folderId)) throw new Error('custscript_pret_ubl_folder_vbb parameter is not set on the deployment');
 
             const oauthConfigured = !!(tokenUrl && clientId && clientSecret && scope);
             log.audit('B2B BILLS REPORT START', `Deployment: ${script.deploymentId} | url set: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'} | folderId: ${folderId} | todayParam: ${todayParam || '(not set)'}`);
@@ -144,7 +144,7 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/log'],
     }
 
     // ── date / window helpers ────────────────────────────────────────────────
-    // custscript_pret_today_vb is a Date-type parameter, so NetSuite hands back a Date object
+    // custscript_pret_today_vbb is a Date-type parameter, so NetSuite hands back a Date object
     // directly. The string-parse branch is a defensive fallback in case it's ever redefined as text.
     function resolveToday(todayParam) {
         if (todayParam instanceof Date) return todayParam;
