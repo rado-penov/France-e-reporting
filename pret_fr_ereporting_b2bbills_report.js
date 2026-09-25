@@ -43,10 +43,6 @@
  *   custscript_pret_oauth_scope_vbb          Free-form text            — OAuth2 scope
  *   custscript_pret_api_doc_type_vbb         Free-form text            — Value sent as the X-Pret-Document-Type header
  *   custscript_pret_ubl_folder_vbb           Integer                   — File Cabinet folder ID for XML files
- *   custscript_pret_today_vbb             Free-form text — TEST ONLY. When set, the script behaves
- *                                         as if "today" were this date (enter in your NetSuite
- *                                         date format), so you can simulate the 1st/11th/21st runs.
- *                                         Leave blank in production.
  */
 define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/encode', 'N/log'],
 (search, file, https, runtime, format, encode, log) => {
@@ -64,14 +60,13 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/encode', 'N
             const scope        = script.getParameter({ name: 'custscript_pret_oauth_scope_vbb' });
             const apiDocType   = script.getParameter({ name: 'custscript_pret_api_doc_type_vbb' });
             const folderId    = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder_vbb' }), 10);
-            const todayParam  = script.getParameter({ name: 'custscript_pret_today_vbb' });
 
             if (!folderId || isNaN(folderId)) throw new Error('custscript_pret_ubl_folder_vbb parameter is not set on the deployment');
 
             const oauthConfigured = !!(tokenUrl && clientId && clientSecret && scope);
-            log.audit('B2B BILLS REPORT START', `Deployment: ${script.deploymentId} | url set: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'} | folderId: ${folderId} | todayParam: ${todayParam || '(not set)'}`);
+            log.audit('B2B BILLS REPORT START', `Deployment: ${script.deploymentId} | url set: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'} | folderId: ${folderId}`);
 
-            const today = resolveToday(todayParam);
+            const today = new Date();
             log.debug('B2B BILLS REPORT TODAY RESOLVED', `Today: ${fmtYYYYMMDD(today)} (day of month: ${today.getDate()})`);
 
             const window = resolveWindow(today);
@@ -115,8 +110,6 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/encode', 'N
                 try {
                     const bearerToken = getBearerToken(tokenUrl, clientId, clientSecret, scope);
                     log.debug('B2B BILLS REPORT TOKEN CLAIMS', describeJwt(bearerToken));
-                    // TEMPORARY — troubleshooting only. Remove once the API call is confirmed working.
-                    log.debug('B2B BILLS REPORT TOKEN RAW', bearerToken);
                     log.audit('B2B BILLS REPORT API CALLING', `POST ${apiUrl}`);
                     const response = https.post({
                         url:  apiUrl,
@@ -147,20 +140,6 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/encode', 'N
     }
 
     // ── date / window helpers ────────────────────────────────────────────────
-    // custscript_pret_today_vbb is a Date-type parameter, so NetSuite hands back a Date object
-    // directly. The string-parse branch is a defensive fallback in case it's ever redefined as text.
-    function resolveToday(todayParam) {
-        if (todayParam instanceof Date) return todayParam;
-        if (todayParam) {
-            try {
-                return format.parse({ value: todayParam, type: format.Type.DATE });
-            } catch (e) {
-                log.error('B2B BILLS REPORT TODAY PARAM INVALID', `Value: ${todayParam} | ${e.message} — falling back to real today`);
-            }
-        }
-        return new Date();
-    }
-
     // today=11 -> 1st-10th | today=21 -> 11th-20th | today=1 -> prev month 21st..end (excl. today) | else null
     function resolveWindow(today) {
         const y = today.getFullYear();
