@@ -17,8 +17,10 @@
  *   mismatch is logged for manual review instead. If the PO doesn't resolve, this falls back to
  *   the standalone path rather than failing.
  * - Standalone (isIssuedAgainstOrder = false): builds the bill with record.create(), lines on the
- *   'item' sublist resolved via invoiceLines[].item.sellersItem.id against the Item's `itemid`
- *   (falls back to DEFAULT_ITEM_ID if unmatched). Account/tax code are left to the item's own
+ *   'item' sublist resolved against the Item's `itemid` by trying, in order, invoiceLines[].item
+ *   .sellersItem.id, .buyersItem.id, .standardItem.id, .name and .description[0]. Falls back to
+ *   DEFAULT_ITEM_ID when none match or the line carries no item code at all — many suppliers
+ *   send free text only (e.g. STEF, 2026-08-31). Account/tax code are left to the item's own
  *   defaults; subsidiary/currency default from the resolved vendor.
  * - Both paths leave approval status to NetSuite's own routing default.
  * - Supplier PDF: downloaded from the `links` href (rel='file') after save, filed and attached to
@@ -27,7 +29,7 @@
  * - Response is always HTTP 200 with a body-level { success, internalId, bumId, message }.
  *
  * Script parameters (set on the Script record, valued per deployment):
- *   custscript_pret_ap_pdf_folder    Integer  — F1ile Cabinet folder internal ID
+ *   custscript_pret_ap_pdf_folder    Integer  — File Cabinet folder internal ID
  *   custscript_pret_ap_api_user      Free-Form Text — Basware API username
  *   custscript_pret_ap_api_password  Password — Basware API password
  *   custscript_pret_ap_api_hosts     Free-Form Text — comma-separated allowed hosts for the
@@ -43,8 +45,8 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
     const APPROVAL_STATUS_FIELD = 'approvalstatus';
     const PENDING_APPROVAL_VALUE = '1';
 
-    // Fallback used when no NetSuite item matches invoiceLines[].item.sellersItem.id,
-    // so an unmapped item never blocks bill creation.
+    // Fallback used when no NetSuite item matches any of the line's item identifiers (or the
+    // line carries none), so an unmapped item never blocks bill creation.
     const DEFAULT_ITEM_ID = '49662';
 
     const PARAM_PDF_FOLDER    = 'custscript_pret_ap_pdf_folder';
@@ -253,18 +255,36 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
     // Resolves the NetSuite item + line values for one invoiceLines[] entry. Shared by both
     // the standalone (fresh lines) and PO-matched (in-place edit) paths.
     function resolveInvoiceLine(line, bumId) {
-        const qty          = (line.quantity && line.quantity.amount) || 1;
-        const price        = (line.price && line.price.amount) || 0;
-        const sellersItemId = line.item && line.item.sellersItem && line.item.sellersItem.id;
-        if (!sellersItemId) throw new Error(`Line ${line.id || ''} missing item.sellersItem.id`);
+        const qty   = (line.quantity && line.quantity.amount) || 1;
+        const price = (line.price && line.price.amount) || 0;
+        const item  = line.item || {};
 
-        const itemDesc = (line.item && Array.isArray(line.item.description) && line.item.description.join(' '))
-                      || (line.item && line.item.name)
+        const itemDesc = (Array.isArray(item.description) && item.description.join(' '))
+                      || item.name
                       || '';
 
-        let itemId = findItemBySellersId(sellersItemId);
+        // Candidate identifiers, most specific first. A line with no sellersItem at all is
+        // normal (free-text suppliers), so its absence must never fail the bill.
+        const candidates = [
+            item.sellersItem  && item.sellersItem.id,
+            item.buyersItem   && item.buyersItem.id,
+            item.standardItem && item.standardItem.id,
+            item.name,
+            Array.isArray(item.description) ? item.description[0] : null
+        ].map(v => (v == null ? '' : String(v).trim()))
+         .filter((v, i, arr) => v && arr.indexOf(v) === i);   // drop blanks and duplicates
+
+        let itemId = null;
+        for (const candidate of candidates) {
+            itemId = findItemBySellersId(candidate);
+            if (itemId) break;
+        }
+
         if (!itemId) {
-            log.audit('AP BILL ITEM FALLBACK', `bumId: ${bumId} | No NetSuite item found with itemid ${sellersItemId} — using default item ${DEFAULT_ITEM_ID}`);
+            log.audit('AP BILL ITEM FALLBACK',
+                `bumId: ${bumId} | line ${line.id || ''}: no NetSuite item matched`
+                + (candidates.length ? ` [${candidates.join(' | ')}]` : ' (line carries no item identifier)')
+                + ` — using default item ${DEFAULT_ITEM_ID}`);
             itemId = DEFAULT_ITEM_ID;
         }
 
@@ -588,7 +608,8 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
     }
 
     // ── Item resolution ──────────────────────────────────────────────────────
-    // Matches invoiceLines[].item.sellersItem.id against the Item record's own 'itemid' field.
+    // Matches one candidate identifier from invoiceLines[].item (seller/buyer/standard code,
+    // name or description) against the Item record's own 'itemid' field.
     function findItemBySellersId(sellersItemId) {
         const results = search.create({
             type: search.Type.ITEM,
