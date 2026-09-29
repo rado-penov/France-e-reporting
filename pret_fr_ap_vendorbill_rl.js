@@ -27,7 +27,7 @@
  * - Response is always HTTP 200 with a body-level { success, internalId, bumId, message }.
  *
  * Script parameters (set on the Script record, valued per deployment):
- *   custscript_pret_ap_pdf_folder    Integer  — File Cabinet folder internal ID
+ *   custscript_pret_ap_pdf_folder    Integer  — F1ile Cabinet folder internal ID
  *   custscript_pret_ap_api_user      Free-Form Text — Basware API username
  *   custscript_pret_ap_api_password  Password — Basware API password
  *   custscript_pret_ap_api_hosts     Free-Form Text — comma-separated allowed hosts for the
@@ -45,7 +45,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
 
     // Fallback used when no NetSuite item matches invoiceLines[].item.sellersItem.id,
     // so an unmapped item never blocks bill creation.
-    const DEFAULT_ITEM_ID = '35051';
+    const DEFAULT_ITEM_ID = '49662';
 
     const PARAM_PDF_FOLDER    = 'custscript_pret_ap_pdf_folder';
     const PARAM_API_USER      = 'custscript_pret_ap_api_user';
@@ -123,9 +123,12 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
             }
 
             if (data.issueDate) bill.setValue('trandate', new Date(data.issueDate));
-            bill.setValue('tranid', (data.externalDocumentIdentifier && data.externalDocumentIdentifier.id) || '');
+            // Supplier's own invoice number: used both as the NetSuite transaction number and
+            // as the record's external ID (field ID is lowercase 'externalid' in SuiteScript).
+            const supplierInvoiceNumber = (data.externalDocumentIdentifier && data.externalDocumentIdentifier.id) || '';
+            bill.setValue('tranid', supplierInvoiceNumber);
+            if (supplierInvoiceNumber) bill.setValue('externalid', supplierInvoiceNumber);
             bill.setValue(BUM_ID_FIELD, bumId);
-            bill.setValue('externalId', (data.externalDocumentIdentifier && data.externalDocumentIdentifier.id) || '');
             log.audit('AP BILL STEP 4 - HEADER SET', `bumId: ${bumId} | vendorId: ${vendorId} | subsidiary: ${subsidiaryId} | poMatched: ${!!poId}`);
 
             const lines = data.invoiceLines || [];
