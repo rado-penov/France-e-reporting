@@ -10,6 +10,19 @@
  * Skips execution when the triggering context is RESTlet — vendor credits created by
  * pret_fr_ap_vendorcredit_rl.js already originated from Basware and must not be exported back to it.
  *
+ * beforeSubmit (CREATE or EDIT, any execution context) — duplicate credit protection
+ * (subsidiary 16 only):
+ *   1. Searches for another vendor credit with the same vendor AND the same tranid (reference
+ *      no.) and throws PRET_DUPLICATE_CREDIT if one exists. Because beforeSubmit fires for every
+ *      path (UI, CSV import, the inbound AP RESTlet, ...) this blocks a UI credit that duplicates
+ *      a RESTlet-created one and vice versa. In the RESTlet the throw surfaces from credit.save()
+ *      and is returned to the caller as { success: false, message }.
+ *      On EDIT the search only runs when vendor or tranid actually changed.
+ *   2. Backstop: sets externalid to "<vendorInternalId>_<tranid>" when it is still empty, so
+ *      NetSuite's own external-ID uniqueness check is a second line of defence. The key is
+ *      vendor-scoped because supplier credit note numbers are only unique per supplier.
+ *   Runs before the afterSubmit UBL export.
+ *
  * Party roles:
  *   AccountingSupplierParty = the Vendor  (issuing the credit note)
  *   AccountingCustomerParty = Subsidiary  (Pret France — receiving the credit)
@@ -23,8 +36,92 @@
  *   custscript_pret_api_doc_type_vc         Free-form text            — Value sent as the X-Pret-Document-Type header
  *   custscript_pret_ubl_folder_vc           Free-form text            — File Cabinet folder ID for XML files
  */
-define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
-(record, file, https, runtime, log) => {
+define(['N/record', 'N/search', 'N/error', 'N/file', 'N/https', 'N/runtime', 'N/log'],
+(record, search, error, file, https, runtime, log) => {
+
+    const FRANCE_SUBSIDIARY_ID = '16';
+
+    // ── beforeSubmit ─────────────────────────────────────────────────────────
+    // Duplicate protection for France (subsidiary 16) vendor credits. Deliberately NOT gated on
+    // execution context: the whole point is that a duplicate is refused at save time no matter
+    // where the credit comes from (UI, RESTlet, CSV import, ...).
+    function beforeSubmit(context) {
+        const { CREATE, EDIT } = context.UserEventType;
+        if (context.type !== CREATE && context.type !== EDIT) return;
+
+        const vc = context.newRecord;
+        if (String(vc.getValue('subsidiary')) !== FRANCE_SUBSIDIARY_ID) return;
+
+        const vendorId = vc.getValue('entity');
+        const tranId   = String(vc.getValue('tranid') || '').trim();
+        if (!tranId) {
+            log.audit('DUP CHECK SKIPPED', `record id: ${vc.id} | tranid is empty — nothing to check`);
+            return;
+        }
+
+        // 1. Hard block: another credit for the same vendor with the same reference number.
+        //    On EDIT, only re-check when the identifying fields actually changed so that
+        //    routine edits of existing credits are never blocked by legacy data.
+        let needsCheck = true;
+        if (context.type === EDIT && context.oldRecord) {
+            const oldVendor = String(context.oldRecord.getValue('entity') || '');
+            const oldTranId = String(context.oldRecord.getValue('tranid') || '').trim();
+            needsCheck = oldVendor !== String(vendorId || '') || oldTranId !== tranId;
+        }
+
+        if (needsCheck) {
+            const dupId = findDuplicateCredit(vendorId, tranId, vc.id);
+            if (dupId) {
+                log.error('DUPLICATE CREDIT BLOCKED',
+                    `tranid: ${tranId} | vendorId: ${vendorId} | existing credit internalId: ${dupId}` +
+                    ` | executionContext: ${runtime.executionContext} | event: ${context.type}`);
+                throw error.create({
+                    name: 'PRET_DUPLICATE_CREDIT',
+                    message: `A vendor credit with reference number "${tranId}" already exists for this vendor` +
+                             ` (internal ID ${dupId}). Duplicate credits are not allowed.`,
+                    notifyOff: true
+                });
+            }
+            log.audit('DUP CHECK PASSED', `tranid: ${tranId} | vendorId: ${vendorId} | executionContext: ${runtime.executionContext}`);
+        }
+
+        // 2. Backstop: vendor-scoped external ID so NetSuite's own uniqueness check also
+        //    applies. Never overwrite a value that is already set. Failure here must not
+        //    block the save — the search above is the primary control.
+        try {
+            if (!vc.getValue('externalid')) {
+                const extId = `${vendorId}_${tranId}`;
+                vc.setValue({ fieldId: 'externalid', value: extId });
+                log.audit('EXTID SET', `tranid: ${tranId} | externalid: ${extId} | executionContext: ${runtime.executionContext}`);
+            }
+        } catch (e) {
+            log.error('EXTID FAILED', `record id: ${vc.id} | ${e.message}\n${e.stack}`);
+        }
+    }
+
+    // Returns the internal ID of another vendor credit with the same vendor and reference number,
+    // or null. Excludes the record currently being saved (EDIT). A search failure is logged and
+    // re-thrown: silently allowing a duplicate would defeat the purpose of this check.
+    function findDuplicateCredit(vendorId, tranId, currentId) {
+        const filters = [
+            ['mainline', 'is', 'T'], 'and',
+            ['tranid', 'is', tranId]
+        ];
+        if (vendorId) filters.push('and', ['entity', 'anyof', vendorId]);
+        if (currentId) filters.push('and', ['internalid', 'noneof', currentId]);
+
+        try {
+            const results = search.create({
+                type: search.Type.VENDOR_CREDIT,
+                filters,
+                columns: ['internalid']
+            }).run().getRange({ start: 0, end: 1 });
+            return results.length ? results[0].getValue('internalid') : null;
+        } catch (e) {
+            log.error('DUP CHECK SEARCH FAILED', `tranid: ${tranId} | vendorId: ${vendorId} | ${e.name}: ${e.message}`);
+            throw e;
+        }
+    }
 
     // ── afterSubmit ──────────────────────────────────────────────────────────
     function afterSubmit(context) {
@@ -530,5 +627,5 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
 </CreditNote>`;
     }
 
-    return { afterSubmit };
+    return { beforeSubmit, afterSubmit };
 });

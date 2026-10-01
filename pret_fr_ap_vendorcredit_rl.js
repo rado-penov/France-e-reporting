@@ -12,6 +12,12 @@
  * Idempotency: bumId (top-level UUID on the payload) is matched against BUM_ID_FIELD on
  * the Vendor Credit. A repeat bumId returns the existing internal ID instead of duplicating.
  *
+ * Duplicate protection: a DIFFERENT bumId whose supplier credit note number already exists as a
+ * vendor credit for the same vendor (created via UI, RESTlet or anything else) is refused with
+ * { success: false, existingInternalId, message }. The same rule is enforced again at save time
+ * by pret_fr_evendorcredit_ue.js beforeSubmit (PRET_DUPLICATE_CREDIT), which also owns the
+ * vendor-scoped externalid backstop — this script does not set externalid itself.
+ *
  * PO handling: only the standalone (isIssuedAgainstOrder = false) path is implemented.
  * PO-matched credits are rejected with a not-yet-implemented message pending mapping decisions.
  * Standalone credits are left to NetSuite's own approval routing default (Pending Approval on
@@ -116,8 +122,28 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
             const credit = record.create({ type: record.Type.VENDOR_CREDIT, isDynamic: true });
             credit.setValue('entity', vendorId);
             if (subsidiaryId) credit.setValue('subsidiary', subsidiaryId);
+            // Supplier's own credit note number becomes the NetSuite reference number (tranid).
+            // Duplicate check BEFORE any further work: same vendor + same number = refuse.
+            // (A repeat of the same bumId was already handled above as an idempotent match.)
+            const supplierCreditNumber = String((data.externalDocumentIdentifier && data.externalDocumentIdentifier.id) || '').trim();
+            if (supplierCreditNumber) {
+                const existingCreditId = findCreditByVendorAndNumber(vendorId, supplierCreditNumber);
+                if (existingCreditId) {
+                    log.error('AP CREDIT DUPLICATE NUMBER',
+                        `bumId: ${bumId} | vendorId: ${vendorId} | credit number: ${supplierCreditNumber}` +
+                        ` | existing credit internalId: ${existingCreditId} — refused`);
+                    return {
+                        success: false,
+                        bumId,
+                        existingInternalId: existingCreditId,
+                        message: `Duplicate: a vendor credit with reference number "${supplierCreditNumber}" already exists` +
+                                 ` for this vendor (internal ID ${existingCreditId})`
+                    };
+                }
+            }
+
             if (data.issueDate) credit.setValue('trandate', new Date(data.issueDate));
-            credit.setValue('tranid', (data.externalDocumentIdentifier && data.externalDocumentIdentifier.id) || '');
+            credit.setValue('tranid', supplierCreditNumber);
             credit.setValue(BUM_ID_FIELD, bumId);
             log.audit('AP CREDIT STEP 4 - HEADER SET', `bumId: ${bumId} | vendorId: ${vendorId} | subsidiary: ${subsidiaryId}`);
 
@@ -194,6 +220,22 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
         const results = search.create({
             type: record.Type.VENDOR_CREDIT,
             filters: [[BUM_ID_FIELD, 'is', bumId]],
+            columns: ['internalid']
+        }).run().getRange({ start: 0, end: 1 });
+        return results.length ? results[0].getValue('internalid') : null;
+    }
+
+    // ── Duplicate lookup: same vendor + same reference number ────────────────
+    function findCreditByVendorAndNumber(vendorId, tranId) {
+        const filters = [
+            ['mainline', 'is', 'T'], 'and',
+            ['tranid', 'is', tranId]
+        ];
+        if (vendorId) filters.push('and', ['entity', 'anyof', vendorId]);
+
+        const results = search.create({
+            type: search.Type.VENDOR_CREDIT,
+            filters,
             columns: ['internalid']
         }).run().getRange({ start: 0, end: 1 });
         return results.length ? results[0].getValue('internalid') : null;
