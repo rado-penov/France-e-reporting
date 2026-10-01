@@ -3,15 +3,18 @@
  * @NScriptType UserEventScript
  *
  * Sends approval / rejection notifications to Basware when the Document Status of a
- * French Vendor Bill or Vendor Credit changes on edit, or is already Open/Rejected
- * (or Pending Approval, for UI-created records — see below) at creation.
+ * French Vendor Bill or Vendor Credit changes, or is already Open/Rejected at
+ * creation (UI-created records only — see below).
  *
  * Rules:
  * - Subsidiary must be France (internal id 16).
- * - Bills created by the AP RESTlet notify on Open and Rejected (edit only — RESTlet
- *   creates are skipped on create; the first status-changing edit picks them up).
- * - Bills created any other way (UI) notify on Open only, on both create and edit.
- * - Vendor Credits follow the same subsidiary rule and notify on Open and Rejected.
+ * - Both Vendor Bills and Vendor Credits notify on Open and Rejected, regardless of
+ *   whether they were created via the UI or the AP RESTlet.
+ * - Bills/credits created by the AP RESTlet notify on edit only — RESTlet creates are
+ *   skipped on create; the first status-changing edit picks them up.
+ * - Bills/credits created any other way (UI) notify on both create and edit — one
+ *   saved directly as Open or Rejected (no approval required) is caught on create; one
+ *   that starts Pending Approval is caught on the edit that later approves/rejects it.
  * - On create, notifications only fire for UI-created records; RESTlet-created
  *   records are skipped on create.
  *
@@ -21,23 +24,23 @@
  * true means the record came in through the UI.
  *
  * Deploy on Vendor Bill and Vendor Credit. Leave the deployment's Event Type field
- * blank so it defers to the Create/Edit/XEdit handling below.
+ * blank so it defers to the Create/Edit handling below. Inline edits (XEdit) are not
+ * handled — only full record Create and Edit events trigger a notification check.
  *
  * Record data is read with record.load() rather than search.lookupFields(): the
  * search index can lag behind the record store right after a create/edit, which
  * previously caused this script to read a stale pre-save Document Status.
  *
- * NetSuite's Bill Approval Routing can auto-approve a UI-created record (Pending
- * Approval -> Open) through a process that never resubmits the record, so no further
- * afterSubmit fires for it, and by the time this script runs, record.load() can still
- * return the pre-approval Document Status (the derived status field lags behind the
- * System Notes audit trail, which is written as soon as the underlying field changes).
- * To handle this, on create for a UI-created record this script checks System Notes
- * for a Document Status change whose OLD value is "Pending Approval"; if found, the
- * record is treated as Open and notified immediately.
+ * NetSuite's Bill Approval Routing auto-approving a UI-created record (Pending
+ * Approval -> Open) fires a genuine afterSubmit(edit) with the real old/new Document
+ * Status values, so it is picked up by the normal edit handling below with no special
+ * detection needed. An earlier version of this script tried to pre-empt that edit by
+ * detecting the pending approval via System Notes on create and notifying immediately
+ * — that duplicated the notification the subsequent real edit already sent, so it was
+ * removed.
  */
-define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
-(record, search, https, runtime, log) => {
+define(['N/record', 'N/https', 'N/runtime', 'N/log'],
+(record, https, runtime, log) => {
 
     const API_URL_PARAM = 'custscript_pret_api_url_tsn';
     const TOKEN_URL_PARAM = 'custscript_pret_oauth_token_url_tsn';
@@ -49,7 +52,6 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
     const FRANCE_SUBSIDIARY_ID = '16';
     const UUID_FIELD = 'custbody_pret_uuid';
     const UBL_EXPORT_READY_FIELD = 'custbody_pret_ubl_export_ready';
-    const PENDING_APPROVAL_OLD_VALUE = 'Pending Approval';
 
     // TBC: confirm the Document Status field id and that it exposes "Open" / "Rejected"
     const STATUS_FIELD = 'status';
@@ -68,9 +70,8 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
 
         try {
             if (context.type !== context.UserEventType.CREATE &&
-                context.type !== context.UserEventType.EDIT &&
-                context.type !== context.UserEventType.XEDIT) {
-                log.audit('STATUS NOTIFICATION SKIPPED', `Event type is "${context.type}", expected create, edit or xedit`);
+                context.type !== context.UserEventType.EDIT) {
+                log.audit('STATUS NOTIFICATION SKIPPED', `Event type is "${context.type}", expected create or edit`);
                 return;
             }
 
@@ -95,25 +96,11 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
             }
 
             const oldStatus = normalizeStatusValue(readRecordStatus(context.oldRecord));
-            let newStatus = normalizeStatusValue(details.statusText || details.statusValue);
+            const newStatus = normalizeStatusValue(details.statusText || details.statusValue);
 
             log.audit('STATUS NOTIFICATION STATUS CHECK',
                 `old: "${oldStatus || '(none)'}" | new: "${newStatus || '(none)'}" | ` +
                 `raw new value: "${details.statusValue}" | raw new text: "${details.statusText}"`);
-
-            if (isCreate && createdViaUi) {
-                const pendingApprovalNote = findPendingApprovalSystemNote(recordType, transactionId);
-                if (pendingApprovalNote) {
-                    log.audit('STATUS NOTIFICATION CREATE PENDING APPROVAL',
-                        `${recordType} ${transactionId} — System Note found: field "${pendingApprovalNote.field}" old value ` +
-                        `"${pendingApprovalNote.oldValue}" -> new value "${pendingApprovalNote.newValue}" ` +
-                        `(set by: ${pendingApprovalNote.setBy}, date: ${pendingApprovalNote.date}) — treating as Open and notifying now`);
-                    newStatus = 'open';
-                } else {
-                    log.audit('STATUS NOTIFICATION CREATE NO SYSTEM NOTE',
-                        `${recordType} ${transactionId} — no System Note found with Document Status old value "${PENDING_APPROVAL_OLD_VALUE}"`);
-                }
-            }
 
             if (oldStatus === newStatus) {
                 log.audit('STATUS NOTIFICATION SKIPPED', 'Document Status did not change');
@@ -127,11 +114,6 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
 
             if (details.subsidiaryId !== FRANCE_SUBSIDIARY_ID) {
                 log.audit('STATUS NOTIFICATION SKIPPED', `Subsidiary is ${details.subsidiaryId || '(none)'}, expected ${FRANCE_SUBSIDIARY_ID} (France)`);
-                return;
-            }
-
-            if (recordType === 'vendorbill' && createdViaUi && newStatus !== 'open') {
-                log.audit('STATUS NOTIFICATION SKIPPED', `UI-created vendor bill set to "${newStatus}" — only Open is notified`);
                 return;
             }
 
@@ -168,42 +150,6 @@ define(['N/record', 'N/search', 'N/https', 'N/runtime', 'N/log'],
             log.audit('STATUS NOTIFICATION SENT', JSON.stringify(payload));
         } catch (e) {
             log.error('STATUS NOTIFICATION FAILED', `${e.name}: ${e.message}\n${e.stack}`);
-        }
-    }
-
-    function findPendingApprovalSystemNote(recordType, transactionId) {
-        try {
-            const results = search.create({
-                type: search.Type.SYSTEM_NOTE,
-                filters: [
-                    ['recordid', 'is', transactionId],
-                    'AND',
-                    ['oldvalue', 'is', PENDING_APPROVAL_OLD_VALUE]
-                ],
-                columns: [
-                    search.createColumn({ name: 'field' }),
-                    search.createColumn({ name: 'oldvalue' }),
-                    search.createColumn({ name: 'newvalue' }),
-                    search.createColumn({ name: 'name' }),
-                    search.createColumn({ name: 'date', sort: search.Sort.DESC })
-                ]
-            }).run().getRange({ start: 0, end: 5 });
-
-            log.debug('STATUS NOTIFICATION SYSTEM NOTE SEARCH', `${recordType} ${transactionId} | matches: ${results ? results.length : 0}`);
-
-            if (!results || !results.length) return null;
-
-            const note = results[0];
-            return {
-                field: note.getValue('field') || note.getText('field') || '',
-                oldValue: note.getValue('oldvalue') || '',
-                newValue: note.getValue('newvalue') || '',
-                setBy: note.getText('name') || note.getValue('name') || '',
-                date: note.getValue('date') || ''
-            };
-        } catch (e) {
-            log.error('STATUS NOTIFICATION SYSTEM NOTE SEARCH FAILED', `${recordType} ${transactionId} | ${e.name}: ${e.message}`);
-            return null;
         }
     }
 
