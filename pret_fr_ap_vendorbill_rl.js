@@ -8,6 +8,11 @@
  * - Vendor resolution: FR:SIRET (custentity_pret_siret) — the payload carries no NetSuite ID.
  * - Idempotency: bumId matched against BUM_ID_FIELD on the Vendor Bill; a repeat returns the
  *   existing internal ID instead of duplicating.
+ * - Duplicate protection: a DIFFERENT bumId whose supplier invoice number already exists as a
+ *   bill for the same vendor (created via UI, RESTlet or anything else) is refused with
+ *   { success: false, existingInternalId, message }. The same rule is enforced again at save
+ *   time by pret_fr_ebilling_ue.js beforeSubmit (PRET_DUPLICATE_BILL), which also owns the
+ *   vendor-scoped externalid backstop — this script no longer sets externalid itself.
  * - PO-matched (isIssuedAgainstOrder = true): resolves orderReference.id against a PO's tranid
  *   and builds the bill via record.transform() from that PO, then edits the PO's own lines in
  *   place (quantity/rate/description from invoiceLines[], matched by orderLineReference or the
@@ -124,12 +129,28 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
                 if (subsidiaryId) bill.setValue('subsidiary', subsidiaryId);
             }
 
+            // Supplier's own invoice number becomes the NetSuite reference number (tranid).
+            // Duplicate check BEFORE any further work: same vendor + same number = refuse.
+            // (A repeat of the same bumId was already handled above as an idempotent match.)
+            const supplierInvoiceNumber = String((data.externalDocumentIdentifier && data.externalDocumentIdentifier.id) || '').trim();
+            if (supplierInvoiceNumber) {
+                const existingBillId = findBillByVendorAndNumber(vendorId, supplierInvoiceNumber);
+                if (existingBillId) {
+                    log.error('AP BILL DUPLICATE NUMBER',
+                        `bumId: ${bumId} | vendorId: ${vendorId} | invoice number: ${supplierInvoiceNumber}` +
+                        ` | existing bill internalId: ${existingBillId} — refused`);
+                    return {
+                        success: false,
+                        bumId,
+                        existingInternalId: existingBillId,
+                        message: `Duplicate: a vendor bill with reference number "${supplierInvoiceNumber}" already exists` +
+                                 ` for this vendor (internal ID ${existingBillId})`
+                    };
+                }
+            }
+
             if (data.issueDate) bill.setValue('trandate', new Date(data.issueDate));
-            // Supplier's own invoice number: used both as the NetSuite transaction number and
-            // as the record's external ID (field ID is lowercase 'externalid' in SuiteScript).
-            const supplierInvoiceNumber = (data.externalDocumentIdentifier && data.externalDocumentIdentifier.id) || '';
             bill.setValue('tranid', supplierInvoiceNumber);
-            if (supplierInvoiceNumber) bill.setValue('externalid', supplierInvoiceNumber);
             bill.setValue(BUM_ID_FIELD, bumId);
             log.audit('AP BILL STEP 4 - HEADER SET', `bumId: ${bumId} | vendorId: ${vendorId} | subsidiary: ${subsidiaryId} | poMatched: ${!!poId}`);
 
@@ -200,6 +221,22 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
         const results = search.create({
             type: record.Type.VENDOR_BILL,
             filters: [[BUM_ID_FIELD, 'is', bumId]],
+            columns: ['internalid']
+        }).run().getRange({ start: 0, end: 1 });
+        return results.length ? results[0].getValue('internalid') : null;
+    }
+
+    // ── Duplicate lookup: same vendor + same reference number ────────────────
+    function findBillByVendorAndNumber(vendorId, tranId) {
+        const filters = [
+            ['mainline', 'is', 'T'], 'and',
+            ['tranid', 'is', tranId]
+        ];
+        if (vendorId) filters.push('and', ['entity', 'anyof', vendorId]);
+
+        const results = search.create({
+            type: search.Type.VENDOR_BILL,
+            filters,
             columns: ['internalid']
         }).run().getRange({ start: 0, end: 1 });
         return results.length ? results[0].getValue('internalid') : null;
