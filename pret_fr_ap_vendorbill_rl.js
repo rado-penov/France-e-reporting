@@ -5,7 +5,8 @@
  * Inbound AP JSON -> Vendor Bill RESTlet. Accepts Basware "BUM" JSON (same vendor as the
  * outbound NetSuite -> Basware UBL webhook, opposite direction) and creates a Vendor Bill.
  *
- * - Vendor resolution: FR:SIRET (custentity_pret_siret) — the payload carries no NetSuite ID.
+ * - Vendor resolution: FR:SIRET (custentity_pret_siret), or FR:SIREN / FR:SIRENE
+ *   (custentity_pret_siren) when no SIRET is sent — the payload carries no NetSuite ID.
  * - Idempotency: bumId matched against BUM_ID_FIELD on the Vendor Bill; a repeat returns the
  *   existing internal ID instead of duplicating.
  * - Duplicate protection: a DIFFERENT bumId whose supplier invoice number already exists as a
@@ -51,6 +52,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
 
     const BUM_ID_FIELD        = 'custbody_pret_uuid';        // existing field, also used by pret_fr_evendorcredit_ue.js
     const VENDOR_SIRET_FIELD  = 'custentity_pret_siret';
+    const VENDOR_SIREN_FIELD  = 'custentity_pret_siren';
     const APPROVAL_STATUS_FIELD = 'approvalstatus';
     const PENDING_APPROVAL_VALUE = '1';
 
@@ -115,17 +117,17 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
                 // deleting them outright, to keep their line-level PO linkage intact.
                 removeAllLines(bill, 'expense');
             } else {
-                const siret = getSiret(data);
-                if (!siret) {
-                    return { success: false, bumId, message: 'No FR:SIRET identification found in accountingSupplierParty.partyIdentifications' };
+                const supplierId = getSupplierIdentifier(data);
+                if (!supplierId) {
+                    return { success: false, bumId, message: 'No FR:SIRET or FR:SIREN identification found in accountingSupplierParty.partyIdentifications' };
                 }
 
-                vendorId = findVendorBySiret(siret);
+                vendorId = findVendorByIdentifier(supplierId);
                 if (!vendorId) {
-                    log.error('AP BILL VENDOR NOT FOUND', `bumId: ${bumId} | SIRET: ${siret}`);
-                    return { success: false, bumId, message: `No vendor found for SIRET ${siret}` };
+                    log.error('AP BILL VENDOR NOT FOUND', `bumId: ${bumId} | ${supplierId.label}: ${supplierId.id}`);
+                    return { success: false, bumId, message: `No vendor found for ${supplierId.label} ${supplierId.id}` };
                 }
-                log.audit('AP BILL STEP 3 - VENDOR RESOLVED', `bumId: ${bumId} | SIRET: ${siret} | vendorId: ${vendorId}`);
+                log.audit('AP BILL STEP 3 - VENDOR RESOLVED', `bumId: ${bumId} | ${supplierId.label}: ${supplierId.id} | vendorId: ${vendorId}`);
 
                 const vendor = record.load({ type: record.Type.VENDOR, id: vendorId });
                 subsidiaryId = vendor.getValue('subsidiary');
@@ -249,16 +251,29 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
     }
 
     // ── Vendor resolution ────────────────────────────────────────────────────
-    function getSiret(data) {
+    // SIRET first (establishment-level, most specific); SIREN only when no SIRET is sent —
+    // e.g. Uber Eats (2026-09-22) sends a bare SIREN. Basware labels it 'FR:SIRENE', so both
+    // spellings are accepted. Returns { label, id, field } or null.
+    function getSupplierIdentifier(data) {
         const ids = (data.accountingSupplierParty && data.accountingSupplierParty.partyIdentifications) || [];
-        const match = ids.find(pid => pid.schemeId === 'FR:SIRET');
-        return match ? match.id : null;
+        const idFor = schemes => {
+            const match = ids.find(pid => pid && schemes.indexOf(pid.schemeId) !== -1 && String(pid.id || '').trim());
+            return match ? String(match.id).trim() : null;
+        };
+
+        const siret = idFor(['FR:SIRET']);
+        if (siret) return { label: 'SIRET', id: siret, field: VENDOR_SIRET_FIELD };
+
+        const siren = idFor(['FR:SIREN', 'FR:SIRENE']);
+        if (siren) return { label: 'SIREN', id: siren, field: VENDOR_SIREN_FIELD };
+
+        return null;
     }
 
-    function findVendorBySiret(siret) {
+    function findVendorByIdentifier(supplierId) {
         const results = search.create({
             type: record.Type.VENDOR,
-            filters: [[VENDOR_SIRET_FIELD, 'is', siret]],
+            filters: [[supplierId.field, 'is', supplierId.id]],
             columns: ['internalid']
         }).run().getRange({ start: 0, end: 1 });
         return results.length ? results[0].getValue('internalid') : null;
