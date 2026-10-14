@@ -28,22 +28,26 @@
  *   send free text only (e.g. STEF, 2026-08-31). Account/tax code are left to the item's own
  *   defaults; subsidiary/currency default from the resolved vendor.
  * - Both paths leave approval status to NetSuite's own routing default.
- * - Supplier PDF: downloaded from the `links` href (rel='file') after save, filed and attached to
- *   the bill. Best-effort — a failure is reported but never fails the bill. The href is checked
- *   against an allowlist (custscript_pret_ap_api_hosts) before credentials are sent to it.
+ * - Supplier PDF: downloaded from the `attachments[].url` (first entry) after save, filed and
+ *   attached to the bill. Authenticated with an OAuth2 client-credentials bearer token fetched
+ *   from the configured token endpoint. Best-effort — a failure is reported but never fails the
+ *   bill. The url is checked against an allowlist (custscript_pret_ap_api_hosts) before the
+ *   token is sent to it.
  * - Response is always HTTP 200 with a body-level { success, internalId, bumId, message }.
  *
  * Script parameters (set on the Script record, valued per deployment):
- *   custscript_pret_ap_pdf_folder    Integer  — File Cabinet folder internal ID
- *   custscript_pret_ap_api_user      Free-Form Text — Basware API username
- *   custscript_pret_ap_api_password  Password — Basware API password
- *   custscript_pret_ap_api_hosts     Free-Form Text — comma-separated allowed hosts for the
- *                                    file link. Blank = no restriction (logged as a warning).
+ *   custscript_pret_ap_pdf_folder          Integer  — File Cabinet folder internal ID
+ *   custscript_pret_ap_oauth_token_url_vb_in     Free-Form Text — OAuth2 token endpoint URL
+ *   custscript_pret_ap_oauth_client_id_vb_in     Free-Form Text — OAuth2 client_id
+ *   custscript_pret_ap_oauth_client_secret_v Password — OAuth2 client_secret
+ *   custscript_pret_ap_oauth_scope_vb_in         Free-Form Text — OAuth2 scope (optional)
+ *   custscript_pret_ap_api_hosts           Free-Form Text — comma-separated allowed hosts for the
+ *                                          attachment url. Blank = no restriction (logged as a warning).
  *
  * Full history/rationale: AP-JSON-to-VendorBill-Integration.md.
  */
-define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/runtime'],
-(record, search, log, https, file, encode, runtime) => {
+define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
+(record, search, log, https, file, runtime) => {
 
     const BUM_ID_FIELD        = 'custbody_pret_uuid';        // existing field, also used by pret_fr_evendorcredit_ue.js
     const VENDOR_SIRET_FIELD  = 'custentity_pret_siret';
@@ -55,8 +59,10 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
     const DEFAULT_ITEM_ID = '49662';
 
     const PARAM_PDF_FOLDER    = 'custscript_pret_ap_pdf_folder';
-    const PARAM_API_USER      = 'custscript_pret_ap_api_user';
-    const PARAM_API_PASSWORD  = 'custscript_pret_ap_api_password';
+    const PARAM_OAUTH_TOKEN_URL     = 'custscript_pret_ap_oauth_token_url_vb_in';
+    const PARAM_OAUTH_CLIENT_ID     = 'custscript_pret_ap_oauth_client_id_vb_in';
+    const PARAM_OAUTH_CLIENT_SECRET = 'custscript_pret_ap_oauth_client_secret_v';
+    const PARAM_OAUTH_SCOPE         = 'custscript_pret_ap_oauth_scope_vb_in';
     const PARAM_API_HOSTS     = 'custscript_pret_ap_api_hosts';
 
     function post(requestBody) {
@@ -381,27 +387,34 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
         }
     }
 
-    // ── Supplier PDF: download from Basware and file in the File Cabinet ─────
+    // ── Supplier PDF: download the attachment and file in the File Cabinet ───
     // Runs after bill.save() so the NetSuite tranid is available for the filename.
     // Best-effort: never throws — a failure here must not roll back a valid bill.
     function attachSupplierPdf(requestBody, internalId, bumId) {
         try {
             const href = getFileLink(requestBody);
             if (!href) {
-                log.audit('AP BILL PDF - NO FILE LINK', `bumId: ${bumId} | no links entry with rel='file'`);
-                return { fileId: null, message: 'No file link in payload' };
+                log.audit('AP BILL PDF - NO FILE LINK', `bumId: ${bumId} | no attachments entry with a url`);
+                return { fileId: null, message: 'No attachment url in payload' };
             }
 
-            const script     = runtime.getCurrentScript();
-            const folderId   = script.getParameter({ name: PARAM_PDF_FOLDER });
-            const apiUser    = script.getParameter({ name: PARAM_API_USER });
-            const apiPassword = script.getParameter({ name: PARAM_API_PASSWORD });
+            const script       = runtime.getCurrentScript();
+            const folderId     = script.getParameter({ name: PARAM_PDF_FOLDER });
+            const tokenUrl     = script.getParameter({ name: PARAM_OAUTH_TOKEN_URL });
+            const clientId     = script.getParameter({ name: PARAM_OAUTH_CLIENT_ID });
+            const clientSecret = script.getParameter({ name: PARAM_OAUTH_CLIENT_SECRET });
+            const scope        = script.getParameter({ name: PARAM_OAUTH_SCOPE });
 
-            if (!folderId)                return failPdf(bumId, `Script parameter ${PARAM_PDF_FOLDER} is not set`);
-            if (!apiUser || !apiPassword) return failPdf(bumId, `Script parameters ${PARAM_API_USER} / ${PARAM_API_PASSWORD} are not set`);
+            if (!folderId) return failPdf(bumId, `Script parameter ${PARAM_PDF_FOLDER} is not set`);
+            if (!tokenUrl || !clientId || !clientSecret) {
+                return failPdf(bumId, `Script parameters ${PARAM_OAUTH_TOKEN_URL} / ${PARAM_OAUTH_CLIENT_ID} / ${PARAM_OAUTH_CLIENT_SECRET} are not set`);
+            }
 
             const hostError = checkHostAllowed(href, script.getParameter({ name: PARAM_API_HOSTS }), bumId);
             if (hostError) return failPdf(bumId, hostError);
+
+            const token = getOAuthToken(tokenUrl, clientId, clientSecret, scope, bumId);
+            if (token.error) return failPdf(bumId, token.error);
 
             const tranId = search.lookupFields({
                 type: search.Type.VENDOR_BILL,
@@ -411,20 +424,19 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
 
             log.audit('AP BILL PDF - DOWNLOADING', `bumId: ${bumId} | tranid: ${tranId} | url: ${href}`);
 
-            // Headers mirror the Postman request that is known to return a valid PDF.
-            // Basware wants Content-Type: application/json even on this GET, and Accept: */*
-            // rather than application/pdf — narrowing Accept changes what the API returns.
+            // Content-Type/Accept kept as on the original Basware request that is known to
+            // return a valid PDF — narrowing Accept to application/pdf changed what came back.
             const response = https.get({
                 url: href,
                 headers: {
-                    Authorization: basicAuthHeader(apiUser, apiPassword),
+                    Authorization: `Bearer ${token.accessToken}`,
                     'Content-Type': 'application/json',
                     Accept: '*/*'
                 }
             });
 
             if (response.code !== 200) {
-                return failPdf(bumId, `Basware returned HTTP ${response.code}: ${String(response.body || '').substring(0, 300)}`);
+                return failPdf(bumId, `Attachment endpoint returned HTTP ${response.code}: ${String(response.body || '').substring(0, 300)}`);
             }
 
             const rawBody = String(response.body || '');
@@ -438,7 +450,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
                 + ` | bodyLength: ${rawBody.length} | first64: ${rawBody.substring(0, 64)}`);
 
             if (!rawBody.length) {
-                return failPdf(bumId, 'Basware returned HTTP 200 with an empty body — nothing to save');
+                return failPdf(bumId, 'Attachment endpoint returned HTTP 200 with an empty body — nothing to save');
             }
 
             const contents = toBase64(rawBody, bumId);
@@ -481,18 +493,56 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
         return { fileId: null, message };
     }
 
-    // links[] may sit at the top level of the payload or under data — accept either.
+    // attachments[] may sit at the top level of the payload or under data — accept either.
+    // links[] (rel='file', the direct Basware href) is deliberately no longer used.
     function getFileLink(requestBody) {
-        const links = (requestBody && requestBody.links)
-            || (requestBody && requestBody.data && requestBody.data.links)
+        const attachments = (requestBody && requestBody.attachments)
+            || (requestBody && requestBody.data && requestBody.data.attachments)
             || [];
-        const match = links.find(l => l && l.rel === 'file'
-            && (!l.method || String(l.method).toUpperCase() === 'GET'));
-        return match ? match.href : null;
+        const match = attachments.find(a => a && a.url);
+        return match ? String(match.url).trim() : null;
     }
 
-    // The href is attacker-controllable input as far as this script is concerned: it decides
-    // where the Basware credentials are sent. Only talk to hosts we expect. Returns an error
+    // OAuth2 client-credentials grant. Returns { accessToken } or { error }.
+    // Credentials go in the form body (client_secret_post), which Azure AD / APIM accept.
+    function getOAuthToken(tokenUrl, clientId, clientSecret, scope, bumId) {
+        const form = {
+            grant_type: 'client_credentials',
+            client_id: clientId,
+            client_secret: clientSecret
+        };
+        if (scope) form.scope = scope;
+        const body = Object.keys(form)
+            .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(form[k])}`)
+            .join('&');
+
+        const response = https.post({
+            url: tokenUrl,
+            body,
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Accept: 'application/json'
+            }
+        });
+
+        if (response.code !== 200) {
+            return { error: `OAuth token endpoint returned HTTP ${response.code}: ${String(response.body || '').substring(0, 300)}` };
+        }
+
+        let parsed;
+        try { parsed = JSON.parse(response.body); } catch (e) {
+            return { error: `OAuth token response is not JSON: ${String(response.body || '').substring(0, 300)}` };
+        }
+        if (!parsed.access_token) {
+            return { error: `OAuth token response has no access_token: ${String(response.body || '').substring(0, 300)}` };
+        }
+
+        log.audit('AP BILL PDF - TOKEN OBTAINED', `bumId: ${bumId} | token_type: ${parsed.token_type || '(none)'} | expires_in: ${parsed.expires_in || '(none)'}`);
+        return { accessToken: parsed.access_token };
+    }
+
+    // The url is attacker-controllable input as far as this script is concerned: it decides
+    // where the bearer token is sent. Only talk to hosts we expect. Returns an error
     // string when the link should be refused, or null when it is safe to proceed.
     function checkHostAllowed(href, allowedParam, bumId) {
         const match = /^https:\/\/([^\/:?#]+)/i.exec(String(href || ''));
@@ -506,23 +556,13 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
 
         if (!allowed.length) {
             log.audit('AP BILL PDF - HOST NOT RESTRICTED',
-                `bumId: ${bumId} | ${PARAM_API_HOSTS} is blank; sending credentials to ${host}`);
+                `bumId: ${bumId} | ${PARAM_API_HOSTS} is blank; sending bearer token to ${host}`);
             return null;
         }
         if (allowed.indexOf(host) === -1) {
-            return `Refusing to send credentials to unexpected host '${host}' (allowed: ${allowed.join(', ')})`;
+            return `Refusing to send bearer token to unexpected host '${host}' (allowed: ${allowed.join(', ')})`;
         }
         return null;
-    }
-
-    function basicAuthHeader(user, password) {
-        // encode.convert can wrap long output across lines; headers must be a single line.
-        const encoded = encode.convert({
-            string: `${user}:${password}`,
-            inputEncoding: encode.Encoding.UTF_8,
-            outputEncoding: encode.Encoding.BASE_64
-        }).replace(/[\r\n]/g, '');
-        return `Basic ${encoded}`;
     }
 
     // 'Invoice_INVFR123456_1408261036.pdf' — ddmmyyhhmm in account time.
