@@ -142,7 +142,8 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
                 }
             }
 
-            if (data.issueDate) credit.setValue('trandate', new Date(data.issueDate));
+            const tranDate = parseIssueDate(data.issueDate);
+            if (tranDate) credit.setValue('trandate', tranDate);
             credit.setValue('tranid', supplierCreditNumber);
             credit.setValue(BUM_ID_FIELD, bumId);
             log.audit('AP CREDIT STEP 4 - HEADER SET', `bumId: ${bumId} | vendorId: ${vendorId} | subsidiary: ${subsidiaryId}`);
@@ -203,6 +204,15 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
             log.error('AP CREDIT FAILED', `bumId: ${bumId} | ${e.name}: ${e.message}\n${e.stack}`);
             return { success: false, bumId, message: `${e.name}: ${e.message}` };
         }
+    }
+
+    // ── Issue date ───────────────────────────────────────────────────────────
+    // new Date('2026-10-13') is midnight UTC, which on NetSuite's Pacific-time server is still
+    // the 12th — so trandate landed a day early. Build the date from its parts in server-local
+    // time instead. Any time/zone suffix on issueDate is ignored: only the calendar date counts.
+    function parseIssueDate(value) {
+        const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value || '').trim());
+        return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
     }
 
     // ── Validation ───────────────────────────────────────────────────────────

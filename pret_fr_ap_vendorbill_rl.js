@@ -31,9 +31,10 @@
  * - Both paths leave approval status to NetSuite's own routing default.
  * - Supplier PDF: downloaded from the `attachments[].url` (first entry) after save, filed and
  *   attached to the bill. Authenticated with an OAuth2 client-credentials bearer token fetched
- *   from the configured token endpoint. Best-effort — a failure is reported but never fails the
- *   bill. The url is checked against an allowlist (custscript_pret_ap_api_hosts) before the
- *   token is sent to it.
+ *   from the configured token endpoint — unless the url is an Azure SAS link (has a `sig=`
+ *   query parameter), which is fetched with no Authorization header since Azure rejects two
+ *   schemes. Best-effort — a failure is reported but never fails the bill. A bearer-token url
+ *   is checked against an allowlist (custscript_pret_ap_api_hosts) before the token is sent.
  * - Response is always HTTP 200 with a body-level { success, internalId, bumId, message }.
  *
  * Script parameters (set on the Script record, valued per deployment):
@@ -157,7 +158,8 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
                 }
             }
 
-            if (data.issueDate) bill.setValue('trandate', new Date(data.issueDate));
+            const tranDate = parseIssueDate(data.issueDate);
+            if (tranDate) bill.setValue('trandate', tranDate);
             bill.setValue('tranid', supplierInvoiceNumber);
             bill.setValue(BUM_ID_FIELD, bumId);
             log.audit('AP BILL STEP 4 - HEADER SET', `bumId: ${bumId} | vendorId: ${vendorId} | subsidiary: ${subsidiaryId} | poMatched: ${!!poId}`);
@@ -212,6 +214,15 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
             log.error('AP BILL FAILED', `bumId: ${bumId} | ${e.name}: ${e.message}\n${e.stack}`);
             return { success: false, bumId, message: `${e.name}: ${e.message}` };
         }
+    }
+
+    // ── Issue date ───────────────────────────────────────────────────────────
+    // new Date('2026-10-13') is midnight UTC, which on NetSuite's Pacific-time server is still
+    // the 12th — so trandate landed a day early. Build the date from its parts in server-local
+    // time instead. Any time/zone suffix on issueDate is ignored: only the calendar date counts.
+    function parseIssueDate(value) {
+        const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value || '').trim());
+        return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
     }
 
     // ── Validation ───────────────────────────────────────────────────────────
@@ -421,15 +432,28 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
             const scope        = script.getParameter({ name: PARAM_OAUTH_SCOPE });
 
             if (!folderId) return failPdf(bumId, `Script parameter ${PARAM_PDF_FOLDER} is not set`);
-            if (!tokenUrl || !clientId || !clientSecret) {
-                return failPdf(bumId, `Script parameters ${PARAM_OAUTH_TOKEN_URL} / ${PARAM_OAUTH_CLIENT_ID} / ${PARAM_OAUTH_CLIENT_SECRET} are not set`);
+
+            // A SAS link (Azure Blob, '?...&sig=...') carries its own authorization in the query
+            // string. Azure refuses a second scheme alongside it
+            // (DirectApiRequestHasMoreThanOneAuthorization), so no bearer token is fetched or
+            // sent — and with no token going out, the host allowlist has nothing to protect.
+            const isSasUrl = /[?&]sig=/i.test(href);
+            const requestHeaders = { 'Content-Type': 'application/json', Accept: '*/*' };
+
+            if (isSasUrl) {
+                log.audit('AP BILL PDF - SAS URL', `bumId: ${bumId} | url carries a SAS signature; downloading without a bearer token`);
+            } else {
+                if (!tokenUrl || !clientId || !clientSecret) {
+                    return failPdf(bumId, `Script parameters ${PARAM_OAUTH_TOKEN_URL} / ${PARAM_OAUTH_CLIENT_ID} / ${PARAM_OAUTH_CLIENT_SECRET} are not set`);
+                }
+
+                const hostError = checkHostAllowed(href, script.getParameter({ name: PARAM_API_HOSTS }), bumId);
+                if (hostError) return failPdf(bumId, hostError);
+
+                const token = getOAuthToken(tokenUrl, clientId, clientSecret, scope, bumId);
+                if (token.error) return failPdf(bumId, token.error);
+                requestHeaders.Authorization = `Bearer ${token.accessToken}`;
             }
-
-            const hostError = checkHostAllowed(href, script.getParameter({ name: PARAM_API_HOSTS }), bumId);
-            if (hostError) return failPdf(bumId, hostError);
-
-            const token = getOAuthToken(tokenUrl, clientId, clientSecret, scope, bumId);
-            if (token.error) return failPdf(bumId, token.error);
 
             const tranId = search.lookupFields({
                 type: search.Type.VENDOR_BILL,
@@ -441,14 +465,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
 
             // Content-Type/Accept kept as on the original Basware request that is known to
             // return a valid PDF — narrowing Accept to application/pdf changed what came back.
-            const response = https.get({
-                url: href,
-                headers: {
-                    Authorization: `Bearer ${token.accessToken}`,
-                    'Content-Type': 'application/json',
-                    Accept: '*/*'
-                }
-            });
+            const response = https.get({ url: href, headers: requestHeaders });
 
             if (response.code !== 200) {
                 return failPdf(bumId, `Attachment endpoint returned HTTP ${response.code}: ${String(response.body || '').substring(0, 300)}`);
