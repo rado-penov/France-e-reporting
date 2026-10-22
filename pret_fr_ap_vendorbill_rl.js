@@ -29,13 +29,16 @@
  *   send free text only (e.g. STEF, 2026-08-31). Account/tax code are left to the item's own
  *   defaults; subsidiary/currency default from the resolved vendor.
  * - Both paths leave approval status to NetSuite's own routing default.
- * - Supplier PDF: downloaded from the `attachments[].url` (first entry) after save, filed and
- *   attached to the bill. Authenticated with an OAuth2 client-credentials bearer token fetched
- *   from the configured token endpoint — unless the url is an Azure SAS link (has a `sig=`
- *   query parameter), which is fetched with no Authorization header since Azure rejects two
- *   schemes. Best-effort — a failure is reported but never fails the bill. A bearer-token url
- *   is checked against an allowlist (custscript_pret_ap_api_hosts) before the token is sent.
- * - Response is always HTTP 200 with a body-level { success, internalId, bumId, message }.
+ * - Supplier PDFs: EVERY `attachments[].url` entry is downloaded after save, filed and attached
+ *   to the bill — one File Cabinet file per url (a payload often carries several). Authenticated
+ *   with an OAuth2 client-credentials bearer token fetched once from the configured token
+ *   endpoint and shared across the downloads — unless the url is an Azure SAS link (has a
+ *   `sig=` query parameter), which is fetched with no Authorization header since Azure rejects
+ *   two schemes. Best-effort and per-url — a failure on one attachment is reported but never
+ *   stops the others, and never fails the bill. A bearer-token url is checked against an
+ *   allowlist (custscript_pret_ap_api_hosts) before the token is sent.
+ * - Response is always HTTP 200 with a body-level { success, internalId, bumId, message,
+ *   pdfFileId (first file), pdfFileIds (all files), pdfFiles (per-url detail), pdfMessage }.
  *
  * Script parameters (set on the Script record, valued per deployment):
  *   custscript_pret_ap_pdf_folder          Integer  — File Cabinet folder internal ID
@@ -200,12 +203,14 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
             // Post-submit: the tranid only exists once the record is saved.
             const pdf = attachSupplierPdf(requestBody, internalId, bumId);
 
-            log.audit('AP BILL COMPLETE', `bumId: ${bumId} | internalId: ${internalId} | pdfFileId: ${pdf.fileId}`);
+            log.audit('AP BILL COMPLETE', `bumId: ${bumId} | internalId: ${internalId} | pdfFileIds: [${pdf.fileIds.join(', ')}] | ${pdf.message}`);
             return {
                 success: true,
                 internalId,
                 bumId,
-                pdfFileId: pdf.fileId,
+                pdfFileId: pdf.fileId,          // first saved file — kept for existing consumers
+                pdfFileIds: pdf.fileIds,        // every saved file, one per attachments[].url
+                pdfFiles: pdf.files,            // per-url { url, fileId, message }
                 pdfMessage: pdf.message,
                 message: 'Vendor bill created and marked Pending Approval'
             };
@@ -413,16 +418,34 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
         }
     }
 
-    // ── Supplier PDF: download the attachment and file in the File Cabinet ───
+    // ── Supplier PDFs: download every attachment and file in the File Cabinet ─
     // Runs after bill.save() so the NetSuite tranid is available for the filename.
-    // Best-effort: never throws — a failure here must not roll back a valid bill.
+    // One file per attachments[].url entry — a payload often carries several (invoice PDF plus
+    // supporting documents). Each url is handled independently: a failure on one is logged and
+    // reported but never stops the others, and never fails the bill.
+    // Returns { fileId, fileIds, message, files } — fileId is the first saved file (kept for
+    // backwards compatibility of the response), fileIds every saved file, files one entry per url.
     function attachSupplierPdf(requestBody, internalId, bumId) {
+        const summary = (files) => {
+            const fileIds = files.map(f => f.fileId).filter(Boolean);
+            const failed  = files.length - fileIds.length;
+            return {
+                fileId:  fileIds.length ? fileIds[0] : null,
+                fileIds,
+                files,
+                message: files.length
+                    ? `${fileIds.length} of ${files.length} attachment(s) saved` + (failed ? ` (${failed} failed)` : '')
+                    : 'No attachment url in payload'
+            };
+        };
+
         try {
-            const href = getFileLink(requestBody);
-            if (!href) {
+            const hrefs = getFileLinks(requestBody);
+            if (!hrefs.length) {
                 log.audit('AP BILL PDF - NO FILE LINK', `bumId: ${bumId} | no attachments entry with a url`);
-                return { fileId: null, message: 'No attachment url in payload' };
+                return summary([]);
             }
+            log.audit('AP BILL PDF - ATTACHMENTS FOUND', `bumId: ${bumId} | ${hrefs.length} url(s) to download`);
 
             const script       = runtime.getCurrentScript();
             const folderId     = script.getParameter({ name: PARAM_PDF_FOLDER });
@@ -430,29 +453,11 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
             const clientId     = script.getParameter({ name: PARAM_OAUTH_CLIENT_ID });
             const clientSecret = script.getParameter({ name: PARAM_OAUTH_CLIENT_SECRET });
             const scope        = script.getParameter({ name: PARAM_OAUTH_SCOPE });
+            const allowedHosts = script.getParameter({ name: PARAM_API_HOSTS });
 
-            if (!folderId) return failPdf(bumId, `Script parameter ${PARAM_PDF_FOLDER} is not set`);
-
-            // A SAS link (Azure Blob, '?...&sig=...') carries its own authorization in the query
-            // string. Azure refuses a second scheme alongside it
-            // (DirectApiRequestHasMoreThanOneAuthorization), so no bearer token is fetched or
-            // sent — and with no token going out, the host allowlist has nothing to protect.
-            const isSasUrl = /[?&]sig=/i.test(href);
-            const requestHeaders = { 'Content-Type': 'application/json', Accept: '*/*' };
-
-            if (isSasUrl) {
-                log.audit('AP BILL PDF - SAS URL', `bumId: ${bumId} | url carries a SAS signature; downloading without a bearer token`);
-            } else {
-                if (!tokenUrl || !clientId || !clientSecret) {
-                    return failPdf(bumId, `Script parameters ${PARAM_OAUTH_TOKEN_URL} / ${PARAM_OAUTH_CLIENT_ID} / ${PARAM_OAUTH_CLIENT_SECRET} are not set`);
-                }
-
-                const hostError = checkHostAllowed(href, script.getParameter({ name: PARAM_API_HOSTS }), bumId);
-                if (hostError) return failPdf(bumId, hostError);
-
-                const token = getOAuthToken(tokenUrl, clientId, clientSecret, scope, bumId);
-                if (token.error) return failPdf(bumId, token.error);
-                requestHeaders.Authorization = `Bearer ${token.accessToken}`;
+            if (!folderId) {
+                const msg = failPdf(bumId, `Script parameter ${PARAM_PDF_FOLDER} is not set`).message;
+                return summary(hrefs.map(url => ({ url, fileId: null, message: msg })));
             }
 
             const tranId = search.lookupFields({
@@ -461,62 +466,115 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
                 columns: ['tranid']
             }).tranid;
 
-            log.audit('AP BILL PDF - DOWNLOADING', `bumId: ${bumId} | tranid: ${tranId} | url: ${href}`);
+            // The OAuth token is fetched once, lazily, and shared by every non-SAS url.
+            let bearerToken = null;
+            const getBearerToken = () => {
+                if (bearerToken) return bearerToken;
+                if (!tokenUrl || !clientId || !clientSecret) {
+                    bearerToken = { error: `Script parameters ${PARAM_OAUTH_TOKEN_URL} / ${PARAM_OAUTH_CLIENT_ID} / ${PARAM_OAUTH_CLIENT_SECRET} are not set` };
+                } else {
+                    bearerToken = getOAuthToken(tokenUrl, clientId, clientSecret, scope, bumId);
+                }
+                return bearerToken;
+            };
 
-            // Content-Type/Accept kept as on the original Basware request that is known to
-            // return a valid PDF — narrowing Accept to application/pdf changed what came back.
-            const response = https.get({ url: href, headers: requestHeaders });
-
-            if (response.code !== 200) {
-                return failPdf(bumId, `Attachment endpoint returned HTTP ${response.code}: ${String(response.body || '').substring(0, 300)}`);
-            }
-
-            const rawBody = String(response.body || '');
-            const headers = response.headers || {};
-            const contentType = headers['Content-Type'] || headers['content-type'] || '(none)';
-
-            // Diagnostic: the shape of this body decides how it must be encoded. Keep this —
-            // a blank PDF is almost always visible here as a length or prefix mismatch.
-            log.audit('AP BILL PDF - RESPONSE',
-                `bumId: ${bumId} | code: ${response.code} | contentType: ${contentType}`
-                + ` | bodyLength: ${rawBody.length} | first64: ${rawBody.substring(0, 64)}`);
-
-            if (!rawBody.length) {
-                return failPdf(bumId, 'Attachment endpoint returned HTTP 200 with an empty body — nothing to save');
-            }
-
-            const contents = toBase64(rawBody, bumId);
-            if (!contents) {
-                return failPdf(bumId, 'Could not derive base64 PDF content from the response body');
-            }
-
-            const fileName = buildPdfName(tranId);
-            const pdfFile = file.create({
-                name: fileName,
-                fileType: file.Type.PDF,
-                contents,                            // binary file types expect base64 contents
-                folder: Number(folderId),
-                isOnline: false
+            const files = hrefs.map((href, index) => {
+                const seq = index + 1;
+                try {
+                    const result = downloadAndAttachOne(href, {
+                        internalId, bumId, tranId, folderId, allowedHosts, getBearerToken,
+                        seq, total: hrefs.length
+                    });
+                    return { url: href, fileId: result.fileId, message: result.message };
+                } catch (e) {
+                    return { url: href, fileId: null, message: failPdf(bumId, `[${seq}/${hrefs.length}] ${e.name}: ${e.message}`).message };
+                }
             });
-            const fileId = pdfFile.save();
-            log.audit('AP BILL PDF - SAVED', `bumId: ${bumId} | fileId: ${fileId} | name: ${fileName} | folder: ${folderId}`);
 
-            // Attach separately: the file is already safely in the cabinet at this point, so an
-            // attach failure must still report the fileId rather than collapse into failPdf().
-            try {
-                record.attach({
-                    record: { type: 'file', id: fileId },
-                    to:     { type: record.Type.VENDOR_BILL, id: internalId }
-                });
-                log.audit('AP BILL PDF - ATTACHED', `bumId: ${bumId} | fileId: ${fileId} attached to vendor bill ${internalId} (Communication > Files)`);
-                return { fileId, message: `Saved as ${fileName} and attached to the bill` };
-            } catch (attachErr) {
-                log.error('AP BILL PDF ATTACH FAILED', `bumId: ${bumId} | fileId: ${fileId} | internalId: ${internalId} | ${attachErr.name}: ${attachErr.message}`);
-                return { fileId, message: `Saved as ${fileName} but not attached: ${attachErr.message}` };
-            }
+            return summary(files);
 
         } catch (e) {
-            return failPdf(bumId, `${e.name}: ${e.message}`);
+            const msg = failPdf(bumId, `${e.name}: ${e.message}`).message;
+            return { fileId: null, fileIds: [], files: [], message: msg };
+        }
+    }
+
+    // Downloads ONE attachment url, saves it to the File Cabinet and attaches it to the bill.
+    // Returns { fileId, message }; fileId is null when the download or save failed.
+    function downloadAndAttachOne(href, ctx) {
+        const { internalId, bumId, tranId, folderId, allowedHosts, getBearerToken, seq, total } = ctx;
+        const tag = `[${seq}/${total}]`;
+
+        // A SAS link (Azure Blob, '?...&sig=...') carries its own authorization in the query
+        // string. Azure refuses a second scheme alongside it
+        // (DirectApiRequestHasMoreThanOneAuthorization), so no bearer token is fetched or
+        // sent — and with no token going out, the host allowlist has nothing to protect.
+        const isSasUrl = /[?&]sig=/i.test(href);
+        const requestHeaders = { 'Content-Type': 'application/json', Accept: '*/*' };
+
+        if (isSasUrl) {
+            log.audit('AP BILL PDF - SAS URL', `bumId: ${bumId} | ${tag} url carries a SAS signature; downloading without a bearer token`);
+        } else {
+            const hostError = checkHostAllowed(href, allowedHosts, bumId);
+            if (hostError) return failPdf(bumId, `${tag} ${hostError}`);
+
+            const token = getBearerToken();
+            if (token.error) return failPdf(bumId, `${tag} ${token.error}`);
+            requestHeaders.Authorization = `Bearer ${token.accessToken}`;
+        }
+
+        log.audit('AP BILL PDF - DOWNLOADING', `bumId: ${bumId} | ${tag} tranid: ${tranId} | url: ${href}`);
+
+        // Content-Type/Accept kept as on the original Basware request that is known to
+        // return a valid PDF — narrowing Accept to application/pdf changed what came back.
+        const response = https.get({ url: href, headers: requestHeaders });
+
+        if (response.code !== 200) {
+            return failPdf(bumId, `${tag} Attachment endpoint returned HTTP ${response.code}: ${String(response.body || '').substring(0, 300)}`);
+        }
+
+        const rawBody = String(response.body || '');
+        const headers = response.headers || {};
+        const contentType = headers['Content-Type'] || headers['content-type'] || '(none)';
+
+        // Diagnostic: the shape of this body decides how it must be encoded. Keep this —
+        // a blank PDF is almost always visible here as a length or prefix mismatch.
+        log.audit('AP BILL PDF - RESPONSE',
+            `bumId: ${bumId} | ${tag} code: ${response.code} | contentType: ${contentType}`
+            + ` | bodyLength: ${rawBody.length} | first64: ${rawBody.substring(0, 64)}`);
+
+        if (!rawBody.length) {
+            return failPdf(bumId, `${tag} Attachment endpoint returned HTTP 200 with an empty body — nothing to save`);
+        }
+
+        const contents = toBase64(rawBody, bumId);
+        if (!contents) {
+            return failPdf(bumId, `${tag} Could not derive base64 PDF content from the response body`);
+        }
+
+        const fileName = buildPdfName(tranId, seq);
+        const pdfFile = file.create({
+            name: fileName,
+            fileType: file.Type.PDF,
+            contents,                            // binary file types expect base64 contents
+            folder: Number(folderId),
+            isOnline: false
+        });
+        const fileId = pdfFile.save();
+        log.audit('AP BILL PDF - SAVED', `bumId: ${bumId} | ${tag} fileId: ${fileId} | name: ${fileName} | folder: ${folderId}`);
+
+        // Attach separately: the file is already safely in the cabinet at this point, so an
+        // attach failure must still report the fileId rather than collapse into failPdf().
+        try {
+            record.attach({
+                record: { type: 'file', id: fileId },
+                to:     { type: record.Type.VENDOR_BILL, id: internalId }
+            });
+            log.audit('AP BILL PDF - ATTACHED', `bumId: ${bumId} | ${tag} fileId: ${fileId} attached to vendor bill ${internalId} (Communication > Files)`);
+            return { fileId, message: `Saved as ${fileName} and attached to the bill` };
+        } catch (attachErr) {
+            log.error('AP BILL PDF ATTACH FAILED', `bumId: ${bumId} | ${tag} fileId: ${fileId} | internalId: ${internalId} | ${attachErr.name}: ${attachErr.message}`);
+            return { fileId, message: `Saved as ${fileName} but not attached: ${attachErr.message}` };
         }
     }
 
@@ -526,13 +584,16 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
     }
 
     // attachments[] may sit at the top level of the payload or under data — accept either.
+    // Returns EVERY entry's url (trimmed, blanks and exact repeats dropped), in payload order.
     // links[] (rel='file', the direct Basware href) is deliberately no longer used.
-    function getFileLink(requestBody) {
+    function getFileLinks(requestBody) {
         const attachments = (requestBody && requestBody.attachments)
             || (requestBody && requestBody.data && requestBody.data.attachments)
             || [];
-        const match = attachments.find(a => a && a.url);
-        return match ? String(match.url).trim() : null;
+        if (!Array.isArray(attachments)) return [];
+        return attachments
+            .map(a => (a && a.url != null ? String(a.url).trim() : ''))
+            .filter((url, i, arr) => url && arr.indexOf(url) === i);
     }
 
     // OAuth2 client-credentials grant. Returns { accessToken } or { error }.
@@ -597,8 +658,10 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
         return null;
     }
 
-    // 'Invoice_INVFR123456_1408261036.pdf' — ddmmyyhhmm in account time.
-    function buildPdfName(tranId) {
+    // 'Invoice_INVFR123456_1408261036.pdf' — ddmmyyhhmm in account time. The 2nd, 3rd, ...
+    // attachment of the same bill gets a '_2', '_3', ... suffix so files downloaded within
+    // the same minute never share a name: 'Invoice_INVFR123456_1408261036_2.pdf'.
+    function buildPdfName(tranId, seq) {
         const d = new Date();
         const pad = n => String(n).padStart(2, '0');
         const stamp = pad(d.getDate())
@@ -606,7 +669,8 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
             + String(d.getFullYear()).slice(-2)
             + pad(d.getHours())
             + pad(d.getMinutes());
-        return `Invoice_${tranId || 'UNKNOWN'}_${stamp}.pdf`;
+        const suffix = seq && seq > 1 ? `_${seq}` : '';
+        return `Invoice_${tranId || 'UNKNOWN'}_${stamp}${suffix}.pdf`;
     }
 
     // https.get hands the body back as a *string*, so the shape depends on how NetSuite
