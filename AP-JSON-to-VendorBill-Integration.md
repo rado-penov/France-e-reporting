@@ -111,3 +111,16 @@ Expected result once the RESTlet exists: vendor resolves via SIRET to internal I
 4. **Item override rejected by NetSuite:** the original decision was to force Basware's resolved item onto the matched PO line even if it differed from the PO's own item. Live testing hit `YOU_CANNOT_ADD_AN_ITEM_AND_PURCHASE_ORDER_COMBINATION_THAT_DOES_NOT_EXIST_TO_A_VENDOR_BILL` — NetSuite hard-enforces that an order-linked line's item must already exist on that PO. Reversed: matched lines now only get quantity/rate/description overridden; a mismatched item is logged (`AP BILL PO LINE ITEM MISMATCH`) for manual review instead of applied.
 5. **PO not matching is not a hard failure:** if `orderReference.id` is missing or doesn't resolve to a PO `tranid`, the script logs `PO reference is not matching. Please check with the supplier!` and falls back to the standalone SIRET-based `record.create()` path, rather than rejecting the bill.
 6. **Known caveat, not yet addressed:** none of this updates the PO's own billed-quantity/close tracking — only the line-level linkage needed for display purposes is preserved. Revisit if the PO needs to actually close or reflect billed quantities from this flow.
+
+## PO lookup is now "contains", not exact (2026-10-23)
+
+Suppliers key free text into `orderReference.id` — a live bill arrived with `"BON POUR ACCORD - CDE POFR00022225"`, where only `POFR00022225` is the PO number. An exact `tranid` match on the whole string found nothing, so the bill fell to the standalone path with no PO link.
+
+`findPurchaseOrderByReference()` now breaks the reference into candidates and exact-matches each against a PO `tranid`, first hit wins:
+
+1. the whole trimmed reference (clean payloads still resolve in one search, unchanged behaviour);
+2. every PO-shaped token in it (`PO` + optional letters + digits, any case, e.g. `POFR00022225`, `PO00000002`), upper-cased and longest first — so `Ref POFR00022225/2026` and `pofr00022225` both yield `POFR00022225`.
+
+Nothing else is tried: a bare number such as `2026` is never used as a candidate, so it cannot link the bill to an unrelated PO. (A generic numeric fallback was briefly considered the same day and dropped for that reason.)
+
+Tokens are split on whitespace, commas, semicolons, colons, slashes, brackets and quotes. The `AP BILL STEP 3 - PO RESOLVED` audit line now records both the raw `orderReference` and the token that actually matched. The "PO not matching" fallback to the standalone path is unchanged.

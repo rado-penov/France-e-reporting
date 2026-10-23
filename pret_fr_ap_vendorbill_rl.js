@@ -15,7 +15,9 @@
  *   time by pret_fr_ebilling_ue.js beforeSubmit (PRET_DUPLICATE_BILL), which also owns the
  *   vendor-scoped externalid backstop — this script no longer sets externalid itself.
  * - PO-matched (isIssuedAgainstOrder = true): resolves orderReference.id against a PO's tranid
- *   and builds the bill via record.transform() from that PO, then edits the PO's own lines in
+ *   — "contains", not exact: the reference may be free text around the PO number (e.g.
+ *   "BON POUR ACCORD - CDE POFR00022225"), so the whole value is tried first, then each
+ *   PO-shaped token inside it — and builds the bill via record.transform() from that PO, then edits the PO's own lines in
  *   place (quantity/rate/description from invoiceLines[], matched by orderLineReference or the
  *   line's own `id`) rather than deleting/recreating them — this is what preserves NetSuite's
  *   line-level PO linkage (Related Records, poid/podate/poamount). Item is never overridden on a
@@ -95,13 +97,14 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
             let bill, vendorId, subsidiaryId, poId = null;
 
             if (isPoBill) {
-                const poNumber = data.orderReference && data.orderReference.id;
-                poId = poNumber ? findPurchaseOrderByTranId(poNumber) : null;
+                const poReference = data.orderReference && data.orderReference.id;
+                const poMatch = poReference ? findPurchaseOrderByReference(poReference) : null;
+                poId = poMatch ? poMatch.poId : null;
 
                 if (!poId) {
-                    log.error('AP BILL PO NOT MATCHING', `bumId: ${bumId} | PO tranid: ${poNumber || '(missing)'} | PO reference is not matching. Please check with the supplier!`);
+                    log.error('AP BILL PO NOT MATCHING', `bumId: ${bumId} | orderReference: ${poReference || '(missing)'} | PO reference is not matching. Please check with the supplier!`);
                 } else {
-                    log.audit('AP BILL STEP 3 - PO RESOLVED', `bumId: ${bumId} | PO tranid: ${poNumber} | poId: ${poId}`);
+                    log.audit('AP BILL STEP 3 - PO RESOLVED', `bumId: ${bumId} | orderReference: ${poReference} | matched PO tranid: ${poMatch.matchedOn} | poId: ${poId}`);
                 }
             }
 
@@ -296,6 +299,39 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
     }
 
     // ── PO resolution (isIssuedAgainstOrder = true) ─────────────────────────
+    // orderReference.id is NOT always a bare PO number — suppliers key free text into it, e.g.
+    // "BON POUR ACCORD - CDE POFR00022225" (2026-10-23), where only POFR00022225 is the PO.
+    // So the lookup is "contains" rather than exact: the reference is broken into candidate
+    // tokens and each is exact-matched against a PO tranid, first hit wins. Order tried:
+    //   1. the whole trimmed reference (the normal, clean case — one search, no change);
+    //   2. every PO-shaped token in it ("PO" + optional letters + digits, any case), upper-
+    //      cased and longest first — so "Ref POFR00022225/2026" and "pofr00022225" both
+    //      yield POFR00022225. Nothing else is tried: a bare number like "2026" is never
+    //      used as a candidate, so it can't link the bill to an unrelated PO.
+    // Returns { poId, matchedOn } or null.
+    function findPurchaseOrderByReference(reference) {
+        const candidates = getPoNumberCandidates(reference);
+        for (const candidate of candidates) {
+            const poId = findPurchaseOrderByTranId(candidate);
+            if (poId) return { poId, matchedOn: candidate };
+        }
+        return null;
+    }
+
+    function getPoNumberCandidates(reference) {
+        const full = String(reference || '').trim();
+        if (!full) return [];
+
+        const tokens = full.split(/[\s,;:/()\[\]"']+/).map(t => t.trim()).filter(Boolean);
+        const poShaped = tokens
+            .filter(t => /^PO[A-Z]*\d+$/i.test(t))
+            .map(t => t.toUpperCase())
+            .sort((a, b) => b.length - a.length);
+
+        return [full].concat(poShaped)
+            .filter((v, i, arr) => arr.indexOf(v) === i);   // de-duplicate, keep order
+    }
+
     function findPurchaseOrderByTranId(tranId) {
         const results = search.create({
             type: search.Type.PURCHASE_ORDER,
