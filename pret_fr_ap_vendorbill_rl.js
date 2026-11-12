@@ -30,6 +30,8 @@
  *   DEFAULT_ITEM_ID when none match or the line carries no item code at all — many suppliers
  *   send free text only (e.g. STEF, 2026-08-31). Account/tax code are left to the item's own
  *   defaults; subsidiary/currency default from the resolved vendor.
+ * - Both paths: an orderReference.id that contains no 'PO' (so no 'POFR' either) is copied to
+ *   the body memo — it is the supplier's own reference, not a Pret PO number.
  * - Both paths leave approval status to NetSuite's own routing default.
  * - Supplier PDFs: EVERY `attachments[].url` entry is downloaded after save, filed and attached
  *   to the bill — one File Cabinet file per url (a payload often carries several). Authenticated
@@ -39,8 +41,14 @@
  *   two schemes. Best-effort and per-url — a failure on one attachment is reported but never
  *   stops the others, and never fails the bill. A bearer-token url is checked against an
  *   allowlist (custscript_pret_ap_api_hosts) before the token is sent.
+ * - attachments[].type names the file: 'attachmentFile' -> '..._a.pdf', 'imageFile' ->
+ *   '..._i.pdf' (e.g. Invoice_0158087400_1011260127_a.pdf). Any other/missing type gets no suffix.
+ * - Once the attachments are filed, ONE saved file is also set on custbody_bill_document (a
+ *   'Document' field: holds a single file ID, so the rest are on Files only). Priority: the
+ *   '_a' (attachmentFile) file, else the '_i' (imageFile) file, else the first saved file.
  * - Response is always HTTP 200 with a body-level { success, internalId, bumId, message,
- *   pdfFileId (first file), pdfFileIds (all files), pdfFiles (per-url detail), pdfMessage }.
+ *   pdfFileId (first file), pdfFileIds (all files), pdfFiles (per-url detail), pdfMessage,
+ *   documentFileId (the file set on custbody_bill_document, or null) }.
  *
  * Script parameters (set on the Script record, valued per deployment):
  *   custscript_pret_ap_pdf_folder          Integer  — File Cabinet folder internal ID
@@ -59,12 +67,17 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
     const BUM_ID_FIELD        = 'custbody_pret_uuid';        // existing field, also used by pret_fr_evendorcredit_ue.js
     const VENDOR_SIRET_FIELD  = 'custentity_pret_siret';
     const VENDOR_SIREN_FIELD  = 'custentity_pret_siren';
+    const BILL_DOCUMENT_FIELD = 'custbody_bill_document';    // 'Document' type — one File Cabinet file ID
     const APPROVAL_STATUS_FIELD = 'approvalstatus';
     const PENDING_APPROVAL_VALUE = '1';
 
     // Fallback used when no NetSuite item matches any of the line's item identifiers (or the
     // line carries none), so an unmapped item never blocks bill creation.
     const DEFAULT_ITEM_ID = '49662';
+
+    // attachments[].type -> file-name suffix. Keys are lower-cased; lookup is case-insensitive.
+    // The '_a' file also wins over '_i' for custbody_bill_document.
+    const ATTACHMENT_TYPE_SUFFIX = { attachmentfile: '_a', imagefile: '_i' };
 
     const PARAM_PDF_FOLDER    = 'custscript_pret_ap_pdf_folder';
     const PARAM_OAUTH_TOKEN_URL     = 'custscript_pret_ap_oauth_token_url_vb_in';
@@ -168,6 +181,16 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
             if (tranDate) bill.setValue('trandate', tranDate);
             bill.setValue('tranid', supplierInvoiceNumber);
             bill.setValue(BUM_ID_FIELD, bumId);
+
+            // An orderReference that isn't a PO number (no 'PO' / 'POFR' in it) is the supplier's
+            // own reference, e.g. "00430624" (2026-10-27) — it can never resolve to a PO, so keep
+            // it on the body memo instead of losing it. Applies to both PO and standalone paths.
+            const orderReference = String((data.orderReference && data.orderReference.id) || '').trim();
+            if (orderReference && !/PO/i.test(orderReference)) {
+                bill.setValue('memo', orderReference.substring(0, 999));
+                log.audit('AP BILL ORDER REFERENCE TO MEMO', `bumId: ${bumId} | orderReference: ${orderReference}`);
+            }
+
             log.audit('AP BILL STEP 4 - HEADER SET', `bumId: ${bumId} | vendorId: ${vendorId} | subsidiary: ${subsidiaryId} | poMatched: ${!!poId}`);
 
             const lines = data.invoiceLines || [];
@@ -205,16 +228,18 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
 
             // Post-submit: the tranid only exists once the record is saved.
             const pdf = attachSupplierPdf(requestBody, internalId, bumId);
+            const documentFileId = setBillDocumentField(internalId, pdf.files, bumId);
 
-            log.audit('AP BILL COMPLETE', `bumId: ${bumId} | internalId: ${internalId} | pdfFileIds: [${pdf.fileIds.join(', ')}] | ${pdf.message}`);
+            log.audit('AP BILL COMPLETE', `bumId: ${bumId} | internalId: ${internalId} | pdfFileIds: [${pdf.fileIds.join(', ')}] | documentFileId: ${documentFileId} | ${pdf.message}`);
             return {
                 success: true,
                 internalId,
                 bumId,
                 pdfFileId: pdf.fileId,          // first saved file — kept for existing consumers
                 pdfFileIds: pdf.fileIds,        // every saved file, one per attachments[].url
-                pdfFiles: pdf.files,            // per-url { url, fileId, message }
+                pdfFiles: pdf.files,            // per-url { url, type, fileId, message }
                 pdfMessage: pdf.message,
+                documentFileId,                 // file set on custbody_bill_document ('_a' > '_i'), or null
                 message: 'Vendor bill created and marked Pending Approval'
             };
 
@@ -476,12 +501,13 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
         };
 
         try {
-            const hrefs = getFileLinks(requestBody);
-            if (!hrefs.length) {
+            const links = getFileLinks(requestBody);
+            if (!links.length) {
                 log.audit('AP BILL PDF - NO FILE LINK', `bumId: ${bumId} | no attachments entry with a url`);
                 return summary([]);
             }
-            log.audit('AP BILL PDF - ATTACHMENTS FOUND', `bumId: ${bumId} | ${hrefs.length} url(s) to download`);
+            log.audit('AP BILL PDF - ATTACHMENTS FOUND',
+                `bumId: ${bumId} | ${links.length} url(s) to download | types: [${links.map(l => l.type || '(none)').join(', ')}]`);
 
             const script       = runtime.getCurrentScript();
             const folderId     = script.getParameter({ name: PARAM_PDF_FOLDER });
@@ -493,7 +519,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
 
             if (!folderId) {
                 const msg = failPdf(bumId, `Script parameter ${PARAM_PDF_FOLDER} is not set`).message;
-                return summary(hrefs.map(url => ({ url, fileId: null, message: msg })));
+                return summary(links.map(l => ({ url: l.url, type: l.type || null, fileId: null, message: msg })));
             }
 
             const tranId = search.lookupFields({
@@ -514,16 +540,22 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
                 return bearerToken;
             };
 
-            const files = hrefs.map((href, index) => {
+            // Per-suffix counter: the 1st '_a' file is plain '_a', a 2nd one in the same payload
+            // becomes '_2_a', so two files of the same type never share a name.
+            const occurrences = {};
+            const files = links.map((link, index) => {
                 const seq = index + 1;
+                const type = link.type || null;
+                const typeSuffix = getTypeSuffix(link.type);
+                occurrences[typeSuffix] = (occurrences[typeSuffix] || 0) + 1;
                 try {
-                    const result = downloadAndAttachOne(href, {
+                    const result = downloadAndAttachOne(link.url, {
                         internalId, bumId, tranId, folderId, allowedHosts, getBearerToken,
-                        seq, total: hrefs.length
+                        seq, total: links.length, typeSuffix, occurrence: occurrences[typeSuffix]
                     });
-                    return { url: href, fileId: result.fileId, message: result.message };
+                    return { url: link.url, type, fileId: result.fileId, message: result.message };
                 } catch (e) {
-                    return { url: href, fileId: null, message: failPdf(bumId, `[${seq}/${hrefs.length}] ${e.name}: ${e.message}`).message };
+                    return { url: link.url, type, fileId: null, message: failPdf(bumId, `[${seq}/${links.length}] ${e.name}: ${e.message}`).message };
                 }
             });
 
@@ -538,7 +570,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
     // Downloads ONE attachment url, saves it to the File Cabinet and attaches it to the bill.
     // Returns { fileId, message }; fileId is null when the download or save failed.
     function downloadAndAttachOne(href, ctx) {
-        const { internalId, bumId, tranId, folderId, allowedHosts, getBearerToken, seq, total } = ctx;
+        const { internalId, bumId, tranId, folderId, allowedHosts, getBearerToken, seq, total, typeSuffix, occurrence } = ctx;
         const tag = `[${seq}/${total}]`;
 
         // A SAS link (Azure Blob, '?...&sig=...') carries its own authorization in the query
@@ -588,7 +620,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
             return failPdf(bumId, `${tag} Could not derive base64 PDF content from the response body`);
         }
 
-        const fileName = buildPdfName(tranId, seq);
+        const fileName = buildPdfName(tranId, typeSuffix, occurrence);
         const pdfFile = file.create({
             name: fileName,
             fileType: file.Type.PDF,
@@ -614,22 +646,70 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
         }
     }
 
+    // Fills the 'Document' body field once every url has been filed under Communication > Files.
+    // A Document field holds ONE File Cabinet file ID — not a url, and never a list — so one
+    // saved file is chosen: the '_a' (attachmentFile) one first, else the '_i' (imageFile) one,
+    // else the first saved file of any other type. Only successfully saved files qualify, so a
+    // failed '_a' download falls through to '_i'. Best-effort: a failure is logged and never
+    // fails the bill, which is already saved at this point.
+    // Returns the file ID that was set, or null.
+    function setBillDocumentField(internalId, files, bumId) {
+        const saved = (files || []).filter(f => f && f.fileId);
+        if (!saved.length) {
+            log.audit('AP BILL DOCUMENT FIELD SKIPPED', `bumId: ${bumId} | no attachment was saved — ${BILL_DOCUMENT_FIELD} left blank`);
+            return null;
+        }
+
+        const ofSuffix = suffix => saved.find(f => getTypeSuffix(f.type) === suffix);
+        const chosen = ofSuffix('_a') || ofSuffix('_i') || saved[0];
+        const others = saved.filter(f => f !== chosen).map(f => f.fileId);
+
+        try {
+            record.submitFields({
+                type: record.Type.VENDOR_BILL,
+                id: internalId,
+                values: { [BILL_DOCUMENT_FIELD]: chosen.fileId },
+                options: { enableSourcing: false, ignoreMandatoryFields: true }
+            });
+            log.audit('AP BILL DOCUMENT FIELD SET',
+                `bumId: ${bumId} | internalId: ${internalId} | ${BILL_DOCUMENT_FIELD}: ${chosen.fileId} (type: ${chosen.type || '(none)'})`
+                + (others.length ? ` | ${others.length} further file(s) [${others.join(', ')}] on Files subtab only` : ''));
+            return chosen.fileId;
+        } catch (e) {
+            log.error('AP BILL DOCUMENT FIELD FAILED', `bumId: ${bumId} | internalId: ${internalId} | fileId: ${chosen.fileId} | ${e.name}: ${e.message}`);
+            return null;
+        }
+    }
+
+    // 'attachmentFile' -> '_a', 'imageFile' -> '_i', anything else (or missing) -> ''.
+    function getTypeSuffix(type) {
+        return ATTACHMENT_TYPE_SUFFIX[String(type || '').trim().toLowerCase()] || '';
+    }
+
     function failPdf(bumId, message) {
         log.error('AP BILL PDF FAILED', `bumId: ${bumId} | ${message}`);
         return { fileId: null, message };
     }
 
     // attachments[] may sit at the top level of the payload or under data — accept either.
-    // Returns EVERY entry's url (trimmed, blanks and exact repeats dropped), in payload order.
+    // Returns EVERY entry as { url, type } (url trimmed, blanks and exact url repeats dropped —
+    // first occurrence wins), in payload order. type is 'attachmentFile' / 'imageFile' / ''.
     // links[] (rel='file', the direct Basware href) is deliberately no longer used.
     function getFileLinks(requestBody) {
         const attachments = (requestBody && requestBody.attachments)
             || (requestBody && requestBody.data && requestBody.data.attachments)
             || [];
         if (!Array.isArray(attachments)) return [];
-        return attachments
-            .map(a => (a && a.url != null ? String(a.url).trim() : ''))
-            .filter((url, i, arr) => url && arr.indexOf(url) === i);
+
+        const seen = new Set();
+        const links = [];
+        for (const a of attachments) {
+            const url = a && a.url != null ? String(a.url).trim() : '';
+            if (!url || seen.has(url)) continue;
+            seen.add(url);
+            links.push({ url, type: a.type != null ? String(a.type).trim() : '' });
+        }
+        return links;
     }
 
     // OAuth2 client-credentials grant. Returns { accessToken } or { error }.
@@ -694,10 +774,11 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
         return null;
     }
 
-    // 'Invoice_INVFR123456_1408261036.pdf' — ddmmyyhhmm in account time. The 2nd, 3rd, ...
-    // attachment of the same bill gets a '_2', '_3', ... suffix so files downloaded within
-    // the same minute never share a name: 'Invoice_INVFR123456_1408261036_2.pdf'.
-    function buildPdfName(tranId, seq) {
+    // 'Invoice_0158087400_1011260127_a.pdf' — ddmmyyhhmm in account time, then the type suffix:
+    // '_a' for attachmentFile, '_i' for imageFile, none for any other/missing type.
+    // A 2nd, 3rd, ... file with the SAME suffix in one payload gets a '_2', '_3', ... counter
+    // before the type suffix so names never clash: 'Invoice_0158087400_1011260127_2_a.pdf'.
+    function buildPdfName(tranId, typeSuffix, occurrence) {
         const d = new Date();
         const pad = n => String(n).padStart(2, '0');
         const stamp = pad(d.getDate())
@@ -705,8 +786,8 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
             + String(d.getFullYear()).slice(-2)
             + pad(d.getHours())
             + pad(d.getMinutes());
-        const suffix = seq && seq > 1 ? `_${seq}` : '';
-        return `Invoice_${tranId || 'UNKNOWN'}_${stamp}${suffix}.pdf`;
+        const counter = occurrence && occurrence > 1 ? `_${occurrence}` : '';
+        return `Invoice_${tranId || 'UNKNOWN'}_${stamp}${counter}${typeSuffix || ''}.pdf`;
     }
 
     // https.get hands the body back as a *string*, so the shape depends on how NetSuite
