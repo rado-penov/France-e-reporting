@@ -2,9 +2,27 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  *
+ * Version history (date = commit date):
+ *   v1.0.0  (2026-07-03) - Initial release: UBL 2.1 / EN 16931 XML on invoice save, filed in the
+ *                          File Cabinet and sent via HTTPS API.
+ *   v1.0.1  (2026-07-12) - OAuth2 bearer token auth.
+ *   v1.0.2  (2026-08-25) - Correct tax amounts, FR eligibility check.
+ *   v1.0.3  (2026-09-24) - Hardened export eligibility and seller address lookups.
+ *   v1.1.0  (2026-11-18) - Invoice PDF rendered with the form's Advanced PDF/HTML template, saved
+ *                          to folder 1751997 as Invoice_<tranid>_<ddMMyy>.pdf (Paris date) and
+ *                          attached to the invoice. When the XML was accepted, JSON
+ *                          [{ uuid, pdfInternalId }] is POSTed to the same API URL with the new
+ *                          custscript_pret_pdf_api_doc_type header value. PDF failures are
+ *                          isolated from the UBL outcome. EDIT is now a permanent trigger (the
+ *                          testing-only note is removed); entry audit log added.
+ *
  * Generates a UBL 2.1 / EN 16931 XML for French e-invoicing on invoice save,
  * saves it to the File Cabinet, sends it via HTTPS API and stamps the three
- * export flags on the invoice.
+ * export flags on the invoice. Finally renders the invoice PDF with the existing
+ * Advanced PDF/HTML template on the invoice's form (French wording is driven by the
+ * FR subsidiary), saves it to folder 1751997 as Invoice_{tranid}_{ddMMyy}.pdf and
+ * attaches it to the invoice (Communication > Files). If the XML was accepted, a JSON
+ * [{ uuid, pdfInternalId }] is then POSTed to the same API URL.
  *
  * Script Parameters (defined on the Script record in NetSuite):
  *   custscript_pret_api_url              Free-form text            — API endpoint URL
@@ -13,15 +31,19 @@
  *   custscript_pret_oauth_client_secret  Free-form Text (Password) — OAuth2 client_secret
  *   custscript_pret_oauth_scope          Free-form text            — OAuth2 scope
  *   custscript_pret_api_doc_type         Free-form text            — Value sent as the X-Pret-Document-Type header
+ *   custscript_pret_pdf_api_doc_type     Free-form text            — X-Pret-Document-Type header for the PDF JSON call
  *   custscript_pret_ubl_folder           Integer                   — File Cabinet folder ID for XML files
  */
-define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
-(record, file, https, runtime, log) => {
+define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log', 'N/render', 'N/format'],
+(record, file, https, runtime, log, render, format) => {
+
+    const PDF_FOLDER_ID = 1751997;
 
     // ── afterSubmit ──────────────────────────────────────────────────────────
     function afterSubmit(context) {
+        log.audit('UBL ENTRY', `Type: ${context.type} | Invoice ID: ${context.newRecord.id} | Context: ${runtime.executionContext}`);
         const { CREATE, COPY, EDIT } = context.UserEventType;
-        if (context.type !== CREATE && context.type !== COPY && context.type !== EDIT) return; // TEMP: EDIT added for testing — revert before go-live
+        if (context.type !== CREATE && context.type !== COPY && context.type !== EDIT) return;
 
         try {
             const script      = runtime.getCurrentScript();
@@ -31,6 +53,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
             const clientSecret = script.getParameter({ name: 'custscript_pret_oauth_client_secret' });
             const scope        = script.getParameter({ name: 'custscript_pret_oauth_scope' });
             const apiDocType   = script.getParameter({ name: 'custscript_pret_api_doc_type' });
+            const pdfDocType   = script.getParameter({ name: 'custscript_pret_pdf_api_doc_type' });
             const folderId    = parseInt(script.getParameter({ name: 'custscript_pret_ubl_folder' }), 10);
 
             if (!folderId || isNaN(folderId)) throw new Error('custscript_pret_ubl_folder parameter is not set on the deployment');
@@ -92,10 +115,11 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
             const oauthConfigured = !!(tokenUrl && clientId && clientSecret && scope);
             log.audit('UBL API PARAMS', `Invoice: ${tranId} | url: ${apiUrl || '(empty)'} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'}`);
 
-            let sentToBW = false;
+            let sentToBW    = false;
+            let bearerToken = null;   // reused by the PDF JSON call below
             if (apiUrl && oauthConfigured && apiDocType) {
                 try {
-                    const bearerToken = getBearerToken(tokenUrl, clientId, clientSecret, scope);
+                    bearerToken = getBearerToken(tokenUrl, clientId, clientSecret, scope);
                     log.audit('UBL API CALLING', `Invoice: ${tranId} | POST ${apiUrl}`);
                     const response = https.post({
                         url:  apiUrl,
@@ -131,6 +155,30 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
             });
             log.audit('UBL COMPLETE', `Invoice: ${tranId} | File ID: ${fileId} | Sent to BW: ${sentToBW} | UUID: ${uuid}`);
 
+            // French PDF — isolated so a template/render failure never masks the UBL outcome above
+            try {
+                const pdfFileId = savePdf(inv, tranId);
+                log.audit('PDF FILE SAVED', `Invoice: ${tranId} | File ID: ${pdfFileId}`);
+
+                // Show the PDF under the invoice's Communication > Files subtab
+                record.attach({
+                    record: { type: 'file', id: pdfFileId },
+                    to:     { type: record.Type.INVOICE, id: inv.id }
+                });
+                log.audit('PDF ATTACHED', `Invoice: ${tranId} | File ID: ${pdfFileId}`);
+
+                // Tell Basware which PDF belongs to the XML it just accepted (linked by UUID)
+                if (!sentToBW) {
+                    log.audit('PDF JSON SKIPPED', `Invoice: ${tranId} | XML was not accepted by the API`);
+                } else if (!pdfDocType) {
+                    log.error('PDF JSON SKIPPED', `Invoice: ${tranId} | custscript_pret_pdf_api_doc_type is not set on the deployment`);
+                } else {
+                    sendPdfJson(apiUrl, bearerToken, pdfDocType, uuid, pdfFileId, tranId);
+                }
+            } catch (pdfErr) {
+                log.error('PDF FAILED', `Invoice: ${tranId} | ${pdfErr.message}\n${pdfErr.stack}`);
+            }
+
         } catch (e) {
             log.error('UBL FAILED', `Invoice: ${context.newRecord.id} | ${e.message}\n${e.stack}`);
         }
@@ -153,6 +201,52 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log'],
         const parsed = JSON.parse(response.body);
         if (!parsed.access_token) throw new Error(`Token response missing access_token — Body: ${response.body}`);
         return parsed.access_token;
+    }
+
+    // ── French PDF ───────────────────────────────────────────────────────────
+    // Prints the invoice exactly as the UI Print button does — same form, same Advanced PDF/HTML
+    // template (which already switches to French wording for the FR subsidiary).
+    function savePdf(inv, tranId) {
+        const pdf  = render.transaction({ entityId: Number(inv.id), printMode: render.PrintMode.PDF });
+        pdf.name   = `Invoice_${tranId}_${parisDateDDMMYY()}.pdf`;
+        pdf.folder = PDF_FOLDER_ID;
+        return pdf.save();
+    }
+
+    function sendPdfJson(apiUrl, bearerToken, docType, uuid, pdfFileId, tranId) {
+        const body = JSON.stringify([{ uuid: uuid, pdfInternalId: Number(pdfFileId) }]);
+        log.audit('PDF JSON CALLING', `Invoice: ${tranId} | POST ${apiUrl} | Body: ${body}`);
+        const response = https.post({
+            url:  apiUrl,
+            body: body,
+            headers: {
+                'Content-Type':         'application/json',
+                'Authorization':        `Bearer ${bearerToken}`,
+                'X-Pret-Document-Type': docType
+            }
+        });
+        if (response.code >= 200 && response.code < 300) {
+            log.audit('PDF JSON SENT', `Invoice: ${tranId} | Status: ${response.code}`);
+        } else {
+            log.error('PDF JSON FAILED', `Invoice: ${tranId} | Status: ${response.code} | Body: ${response.body}`);
+        }
+    }
+
+    // Today as ddMMyy in Paris time — the server clock is US Pacific, which would stamp
+    // French evening invoices with the previous day. Formatting with a timezone and parsing
+    // back without one yields a Date whose local fields are the Paris wall-clock time.
+    function parisDateDDMMYY() {
+        let d = new Date();
+        try {
+            d = format.parse({
+                value: format.format({ value: d, type: format.Type.DATETIME, timezone: format.Timezone.EUROPE_PARIS }),
+                type:  format.Type.DATETIME
+            });
+        } catch (e) {
+            log.audit('PDF DATE TZ CONVERSION FAILED', e.message);
+        }
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(d.getDate())}${pad(d.getMonth() + 1)}${String(d.getFullYear()).slice(-2)}`;
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
