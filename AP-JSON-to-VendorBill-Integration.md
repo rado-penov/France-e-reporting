@@ -124,3 +124,17 @@ Suppliers key free text into `orderReference.id` — a live bill arrived with `"
 Nothing else is tried: a bare number such as `2026` is never used as a candidate, so it cannot link the bill to an unrelated PO. (A generic numeric fallback was briefly considered the same day and dropped for that reason.)
 
 Tokens are split on whitespace, commas, semicolons, colons, slashes, brackets and quotes. The `AP BILL STEP 3 - PO RESOLVED` audit line now records both the raw `orderReference` and the token that actually matched. The "PO not matching" fallback to the standalone path is unchanged.
+
+## Vendor credit RESTlet: PDF handling brought level with the bill (2026-10-23)
+
+`pret_fr_ap_vendorcredit_rl.js` still had the original single-file, HTTP-Basic PDF download against the `links[]` href. The bill script had moved on (OAuth2 bearer token 2026-10-14, SAS-link handling and every-attachment loop 2026-10-21). The credit script now carries the same PDF block, with three credit-specific points:
+
+1. **URL source.** The live credit-note payload (Egencia `FRC4999648`, saved as `Credit-JSON-Test-Payload-Standalone.json`) carries **no `attachments[]`** — just two `links[]` entries with `rel: "file"` pointing at `https://api.basware.com/v2/files/<refId>` (one `attachmentFile`, one `imageFile`). So `getFileLinks()` takes `attachments[].url` when present (bill shape) and otherwise every `links[]` rel=file GET href. `links[]` is only consulted when `attachments[]` yields nothing, so nothing is downloaded twice. Both arrays are accepted at the top level or under `data`.
+2. **Parameters.** Basic auth is gone. New OAuth2 parameters on the credit Script record, suffixed `_vc`: `custscript_pret_ap_oauth_token_url_vc`, `custscript_pret_ap_oauth_client_id_vc`, `custscript_pret_ap_oauth_secret_vc` (Password — the `_client_secret_vc` spelling would exceed NetSuite's ID length), `custscript_pret_ap_oauth_scope_vc`. `custscript_pret_ap_pdf_folder_vc` and `custscript_pret_ap_api_hosts_vc` are unchanged. `custscript_pret_ap_api_user_vc` / `custscript_pret_ap_api_password_vc` are no longer read and can be removed. **The allowlist must now include `api.basware.com`** (the credit links are direct Basware hrefs, not Azure SAS links), or every download is refused with "Refusing to send bearer token to unexpected host".
+3. **Filename.** `CreditMemo_<tranid>_<ddmmyyhhmm>.pdf`, with `_2`, `_3`, … on the second and later files of the same credit.
+
+Response gains `pdfFileIds` and `pdfFiles` alongside the existing `pdfFileId` / `pdfMessage`, same as the bill. `N/encode` is no longer loaded.
+
+**Open question for live testing:** the OAuth token the bill uses was configured for the Azure-side attachment endpoint. Whether the same token is accepted by `api.basware.com/v2/files/...` — or whether the credit flow needs its own client credentials against Basware's token endpoint — is TBC on the first real credit note. The `_vc` parameters are separate precisely so the two can differ.
+
+**Documentation:** Technical Service Manual §4.2 and §5.6 still list the Basic-auth parameters for both RESTlets (the bill's were already stale since 2026-10-14). Needs a v1.3 regeneration of the deck/manuals when the next documentation pass is done.
