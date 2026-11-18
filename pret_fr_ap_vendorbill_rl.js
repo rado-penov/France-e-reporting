@@ -34,6 +34,11 @@
  *                          rows, rejected rows) plus diagnostic searches when nothing matches.
  *                          Vendor-code lookup now tries item.sellersItem.id, then item.name,
  *                          then item.id (first match wins); item.description still ignored.
+ *   v1.0.15 (2026-11-18) - Each code is also looked up in the Vendor Supplier Code custom record
+ *                          (customrecord_pret_vendor_suppler_code: Item / Vendor / Supplier Code)
+ *                          after the item's native Vendor Code — so one vendor can map several
+ *                          codes to the same item. Records are written by
+ *                          pret_fr_ap_bill_vendorcode_learn_ue.js or by hand on the item.
  *
  * Inbound AP JSON -> Vendor Bill RESTlet. Accepts Basware "BUM" JSON (same vendor as the
  * outbound NetSuite -> Basware UBL webhook, opposite direction) and creates a Vendor Bill.
@@ -61,9 +66,10 @@
  *   the 'item' sublist per invoiceLines[] entry. Account/tax code are left to the item's own
  *   defaults; subsidiary/currency default from the resolved vendor.
  * - Item resolution (both paths): the line's codes — item.sellersItem.id, then item.name, then
- *   item.id — are looked up in that order in the bill vendor's own item list (the Vendor Code
- *   on the Item's Vendors sublist, what the Vendor's Financial > Items subtab shows), for that
- *   vendor only:
+ *   item.id — are tried in that order, for the bill vendor only. Each code is looked up first
+ *   in the item's native Vendors sublist (Vendor Code, what the Vendor's Financial > Items
+ *   subtab shows), then in the Vendor Supplier Code custom record (Vendor + Supplier Code ->
+ *   Item; several codes per vendor per item allowed). Active records / items only:
  *     1. a code matches a vendor item -> that item; VENDOR_CODE_COL left empty.
  *     2. no code matches              -> DEFAULT_ITEM_ID (Basware generic); the highest-priority
  *                                        code is written to VENDOR_CODE_COL for later mapping.
@@ -120,6 +126,14 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
     // Line field holding the supplier's item code when it did NOT resolve to a vendor item —
     // i.e. only ever filled on lines that fell back to DEFAULT_ITEM_ID.
     const VENDOR_CODE_COL = 'custcol_pret_vendor_code_basware';
+
+    // Vendor Supplier Code custom record: Vendor + Supplier Code -> Item, any number of codes
+    // per vendor per item (the native Vendors sublist allows only one). IDs as created in the
+    // account (note 'suppler'). Filled by pret_fr_ap_bill_vendorcode_learn_ue.js or by hand.
+    const VSC_RECORD = 'customrecord_pret_vendor_suppler_code';
+    const VSC_ITEM   = 'custrecord_pret_vc_item';
+    const VSC_VENDOR = 'custrecord_pret_vc_vendor';
+    const VSC_CODE   = 'custrecord_pret_vc_supplier_code';
 
     // attachments[].type -> file-name suffix. Keys are lower-cased; lookup is case-insensitive.
     // The '_a' file also wins over '_i' for custbody_bill_document.
@@ -436,7 +450,7 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
 
     // Resolves the NetSuite item + line values for one invoiceLines[] entry. Shared by both
     // the standalone (fresh lines) and PO-matched (in-place edit) paths.
-    // Item rule (sellersItem.id vs the vendor's own Vendor Codes):
+    // Item rule (each candidate code: native Vendor Code first, then Vendor Supplier Code record):
     //   match     -> that item,       vendorCode ''
     //   no match  -> DEFAULT_ITEM_ID, vendorCode = sellersItem.id (kept on VENDOR_CODE_COL)
     //   no code   -> DEFAULT_ITEM_ID, vendorCode ''
@@ -473,6 +487,13 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
                 log.audit('AP BILL ITEM BY VENDOR CODE',
                     `bumId: ${bumId} | line ${line.id || ''}: vendor code ${c.code} (from item.${c.source}) -> item ${itemId}`);
                 return { itemId, vendorCode: '', qty, price, itemDesc };
+            }
+            const mappedItemId = findItemBySupplierCodeRecord(vendorId, c.code, bumId);
+            if (mappedItemId) {
+                log.audit('AP BILL ITEM BY SUPPLIER CODE RECORD',
+                    `bumId: ${bumId} | line ${line.id || ''}: supplier code ${c.code} (from item.${c.source})`
+                    + ` -> item ${mappedItemId} (Vendor Supplier Code record)`);
+                return { itemId: mappedItemId, vendorCode: '', qty, price, itemDesc };
             }
         }
 
@@ -1078,6 +1099,52 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
                 + ` [${itemIds.join(', ')}] — using ${itemIds[0]}`);
         }
 
+        return itemIds.length ? itemIds[0] : null;
+    }
+
+    // Second lookup: an ACTIVE Vendor Supplier Code record for THIS vendor + code whose item is
+    // active. Code re-checked case-insensitively; oldest record wins if several match (the
+    // learning UE never creates a second one). Non-fatal: a search failure (e.g. the role lacks
+    // permission on the record) is logged and treated as "no match", so the line falls back to
+    // the generic item instead of failing the bill.
+    // Returns the item internal ID, or null.
+    function findItemBySupplierCodeRecord(vendorId, vendorCode, bumId) {
+        const tag = `bumId: ${bumId} | vendorId: ${vendorId} | supplierCode: '${vendorCode}'`;
+        if (!vendorId || !vendorCode) return null;
+
+        let results;
+        try {
+            results = search.create({
+                type: VSC_RECORD,
+                filters: [
+                    [VSC_VENDOR, 'anyof', vendorId], 'and',
+                    [VSC_CODE, 'is', vendorCode], 'and',
+                    ['isinactive', 'is', 'F'], 'and',
+                    [`${VSC_ITEM}.isinactive`, 'is', 'F']
+                ],
+                columns: [
+                    search.createColumn({ name: 'internalid', sort: search.Sort.ASC }),
+                    VSC_ITEM,
+                    VSC_CODE
+                ]
+            }).run().getRange({ start: 0, end: 20 });
+        } catch (e) {
+            log.error('AP BILL SUPPLIER CODE SEARCH FAILED', `${tag} | ${e.name}: ${e.message}`);
+            return null;
+        }
+
+        const wanted = vendorCode.toLowerCase();
+        const itemIds = results
+            .filter(r => String(r.getValue(VSC_CODE) || '').trim().toLowerCase() === wanted)
+            .map(r => String(r.getValue(VSC_ITEM) || ''))
+            .filter((v, i, arr) => v && arr.indexOf(v) === i);
+
+        log.audit('AP BILL SUPPLIER CODE SEARCH', `${tag} | rowCount: ${results.length} | matching itemIds: [${itemIds.join(', ')}]`);
+
+        if (itemIds.length > 1) {
+            log.audit('AP BILL SUPPLIER CODE AMBIGUOUS',
+                `${tag} | mapped to items [${itemIds.join(', ')}] — using ${itemIds[0]} (oldest record)`);
+        }
         return itemIds.length ? itemIds[0] : null;
     }
 
