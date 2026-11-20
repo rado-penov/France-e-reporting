@@ -15,6 +15,13 @@
  *                          custscript_pret_pdf_api_doc_type header value. PDF failures are
  *                          isolated from the UBL outcome. EDIT is now a permanent trigger (the
  *                          testing-only note is removed); entry audit log added.
+ *   v1.1.1  (2026-11-20) - BR-FR-CO-10 (BT-71-1): DeliveryLocation/cbc:ID (shipaddressee) now
+ *                          always carries a schemeID — 0009 for a valid 14-digit SIRET, otherwise
+ *                          0088 as advised by Basware; omitted when shipaddressee is empty.
+ *                          Customer PartyLegalEntity gains RegistrationName and CompanyLegalForm
+ *                          (custentity_pret_company_legal_name / _legal_form). HTML tags are
+ *                          stripped from the seller CompanyLegalForm and the #PMT# note. Ship-to address read from the shippingaddress
+ *                          subrecord; empty CityName/PostalZone/StreetName elements are omitted.
  *
  * Generates a UBL 2.1 / EN 16931 XML for French e-invoicing on invoice save,
  * saves it to the File Cabinet, sends it via HTTPS API and stamps the three
@@ -257,6 +264,21 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log', 'N/render', 'N/fo
         });
     }
 
+    // HTML → plain text: <br>/<p> become spaces, other tags are dropped, common entities
+    // decoded, whitespace collapsed. esc() is applied afterwards when writing the XML.
+    function stripHtml(v) {
+        return String(v ?? '')
+            .replace(/<\s*(br|\/p|\/div|\/li)\b[^>]*>/gi, ' ')
+            .replace(/<[^>]*>/g, '')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+            .replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'")
+            .replace(/&euro;/gi, '€')
+            .replace(/&amp;/gi, '&')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
     function esc(v) {
         return String(v ?? '')
             .replace(/&/g, '&amp;')
@@ -270,6 +292,34 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log', 'N/render', 'N/fo
         if (!d) return '';
         const dt = d instanceof Date ? d : new Date(d);
         return dt.toISOString().slice(0, 10);
+    }
+
+    // BT-71 / BT-71-1: returns { id, scheme } only for a well-formed identifier, else null.
+    //   14 digits passing the Luhn check → SIRET, scheme 0009
+    //   13 digits passing the GS1 mod-10 check → GLN, scheme 0088
+    function deliveryLocationId(raw) {
+        const v = String(raw || '').replace(/[\s.-]/g, '');
+        if (/^\d{14}$/.test(v) && luhnValid(v)) return { id: v, scheme: '0009' };
+        if (/^\d{13}$/.test(v) && gs1Valid(v))  return { id: v, scheme: '0088' };
+        return null;
+    }
+
+    function luhnValid(d) {
+        let sum = 0;
+        for (let i = 0; i < d.length; i++) {
+            let n = Number(d[d.length - 1 - i]);
+            if (i % 2 === 1) { n *= 2; if (n > 9) n -= 9; }
+            sum += n;
+        }
+        return sum % 10 === 0;
+    }
+
+    function gs1Valid(d) {
+        let sum = 0;
+        for (let i = 0; i < d.length - 1; i++) {
+            sum += Number(d[d.length - 2 - i]) * (i % 2 === 0 ? 3 : 1);
+        }
+        return (10 - (sum % 10)) % 10 === Number(d[d.length - 1]);
     }
 
     function num(v, dp = 2) {
@@ -315,19 +365,22 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log', 'N/render', 'N/fo
         const selZip       = (mainAddr && mainAddr.getValue('zip'))     || 'NOT_SELLER_ZIP';
         const selCountry   = (mainAddr && mainAddr.getValue('country')) || sub.getValue('country') || 'NOT_SELLER_COUNTRY';
         const selVat       = sub.getValue('federalidnumber')                          || 'NOT_SELLER_VAT';
-        const selLegalForm = sub.getValue('custrecord_pret_sub_invoice_footer_text')  || 'NOT_SELLER_LEGAL_FORM';
+        // Footer text is stored as HTML for the PDF template — Basware needs plain text
+        const selLegalForm = stripHtml(sub.getValue('custrecord_pret_sub_invoice_footer_text')) || 'NOT_SELLER_LEGAL_FORM';
         const selContact   = sub.getValue('legalname')                                || 'NOT_SELLER_CONTACT';
         const selPhone     = sub.getValue('custrecord_pret_phone_number')             || 'NOT_SELLER_PHONE';
         const selEmail     = sub.getValue('custrecord_pay_remittance_contact')        || 'NOT_SELLER_EMAIL';
         const selIBAN      = sub.getValue('custrecord_pret_bank_account_iban')        || 'NOT_SELLER_IBAN';
         const selBankName  = sub.getValue('custrecord_pret_bank_name')                || 'NOT_SELLER_BANK_NAME';
         const selBIC       = sub.getValue('custrecord_pret_sort_code_bic')            || 'NOT_SELLER_BIC';
-        const pmtInfoNote  = sub.getValue('custrecord_pret_payment_info')             || '';
+        const pmtInfoNote  = stripHtml(sub.getValue('custrecord_pret_payment_info'))  || '';
 
         // ── Customer ─────────────────────────────────────────────────────────
         const custSiren    = cust.getValue('custentity_pret_siren')                   || 'NOT_CUST_SIREN';
         const custSiret    = cust.getValue('custentity_pret_siret')                   || 'NOT_CUST_SIRET';
         const custName     = cust.getValue('companyname')                             || 'NOT_CUST_NAME';
+        const custLegalName = stripHtml(cust.getValue('custentity_pret_company_legal_name')) || 'NOT_CUST_LEGAL_NAME';
+        const custLegalForm = stripHtml(cust.getValue('custentity_pret_company_legal_form')) || 'NOT_CUST_LEGAL_FORM';
         const custAddr1    = cust.getValue('billaddr1')                               || 'NOT_CUST_ADDR1';
         const custAddr2    = cust.getValue('billaddr2')                               || '';
         const custCity     = cust.getValue('billcity')                                || 'NOT_CUST_CITY';
@@ -342,27 +395,63 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log', 'N/render', 'N/fo
 
         // ── Delivery ─────────────────────────────────────────────────────────
         const deliveryDate = fmtDate(inv.getValue('custbody_pret_delivery_date'))     || '';
-        let delLocId    = inv.getValue('shipaddressee')  || '';
-        let delAddr1    = inv.getValue('shipaddr1')      || '';
-        let delAddr2    = inv.getValue('shipaddr2')      || '';
-        let delCity     = inv.getValue('shipcity')       || '';
-        let delZip      = inv.getValue('shipzip')        || '';
-        let delCountry  = inv.getValue('shipcountry')    || '';
-        let delParty    = inv.getValue('shipattention')  || '';
+        let delAddressee = inv.getValue('shipaddressee')  || '';
+        let delAddr1     = inv.getValue('shipaddr1')      || '';
+        let delAddr2     = inv.getValue('shipaddr2')      || '';
+        let delCity      = inv.getValue('shipcity')       || '';
+        let delZip       = inv.getValue('shipzip')        || '';
+        let delCountry   = inv.getValue('shipcountry')    || '';
+        let delParty     = inv.getValue('shipattention')  || '';
 
-        // Direct fields are unavailable when shipoverride=F — parse the formatted shipaddress field
+        // Flattened ship* body fields are empty when shipoverride=F — read the shippingaddress
+        // subrecord (same pattern as the billing-country lookup in afterSubmit)
+        if (!delAddr1 || !delCity || !delZip || !delCountry) {
+            try {
+                const shipAddr = inv.getSubrecord({ fieldId: 'shippingaddress' });
+                if (shipAddr) {
+                    delAddressee = delAddressee || shipAddr.getValue({ fieldId: 'addressee' }) || '';
+                    delAddr1     = delAddr1     || shipAddr.getValue({ fieldId: 'addr1' })     || '';
+                    delAddr2     = delAddr2     || shipAddr.getValue({ fieldId: 'addr2' })     || '';
+                    delCity      = delCity      || shipAddr.getValue({ fieldId: 'city' })      || '';
+                    delZip       = delZip       || shipAddr.getValue({ fieldId: 'zip' })       || '';
+                    delCountry   = delCountry   || shipAddr.getValue({ fieldId: 'country' })   || '';
+                    delParty     = delParty     || shipAddr.getValue({ fieldId: 'attention' }) || '';
+                }
+            } catch (e) {
+                log.audit('UBL SHIPPING ADDRESS SUBRECORD READ FAILED', `Invoice: ${inv.getValue('tranid')} | ${e.message}`);
+            }
+        }
+
+        // Last resort: parse the formatted shipaddress text (attention, addressee, addr1, [addr2,]
+        // zip+city, country). Only street/city/zip are taken from it — never the location ID.
         if (!delAddr1) {
             const rawAddr = (inv.getValue('shipaddress') || '').replace(/<br\s*\/?>/gi, '\n');
             const lines   = rawAddr.split('\n').map(l => l.trim()).filter(l => l);
-            // Standard NetSuite format: attention, addressee, addr1, [addr2,] city+zip, country
-            const zipIdx  = delZip ? lines.findIndex(l => l.includes(delZip)) : -1;
-            const before  = zipIdx > 0 ? lines.slice(0, zipIdx) : lines.slice(0, -2);
-            delParty  = before[0] || '';
-            delLocId  = before[1] || '';
-            delAddr1  = before[before.length - 1] || '';
-            delAddr2  = before.length > 3 ? before[before.length - 2] : '';
-            if (zipIdx >= 0) delCity = lines[zipIdx].replace(delZip, '').trim();
+            let zipIdx = -1;
+            for (let j = lines.length - 1; j >= 0; j--) {
+                const m = lines[j].match(/^(\d{5})\s+(.+)$/) || lines[j].match(/^(.+?)\s+(\d{5})$/);
+                if (m) {
+                    zipIdx  = j;
+                    delZip  = delZip  || (/^\d{5}$/.test(m[1]) ? m[1] : m[2]);
+                    delCity = delCity || (/^\d{5}$/.test(m[1]) ? m[2] : m[1]);
+                    break;
+                }
+            }
+            if (zipIdx > 0) {
+                delAddr1 = lines[zipIdx - 1];
+                if (zipIdx >= 2 && lines[zipIdx - 2] !== delAddressee && lines[zipIdx - 2] !== delParty) {
+                    delAddr2 = delAddr1;
+                    delAddr1 = lines[zipIdx - 2];
+                }
+            }
         }
+
+        // BT-71 Deliver-to location identifier: only emitted for a real identifier, always with
+        // its scheme (BR-FR-CO-10). A valid 14-digit SIRET → 0009; any other shipaddressee
+        // value is sent with schemeID 0088, as advised by Basware.
+        const delAddresseeTrim = String(delAddressee || '').trim();
+        const delLoc = deliveryLocationId(delAddresseeTrim)
+                    || (delAddresseeTrim ? { id: delAddresseeTrim, scheme: '0088' } : null);
 
         // ── Lines + tax accumulation ─────────────────────────────────────────
         const lineCount  = inv.getLineCount({ sublistId: 'item' });
@@ -473,19 +562,24 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log', 'N/render', 'N/fo
         <cbc:ID>NOTAPPLICABLE</cbc:ID>
     </cac:ProjectReference>`;
 
-        const deliveryBlock = (deliveryDate || delAddr1) ? `
-    <cac:Delivery>
-        ${deliveryDate ? `<cbc:ActualDeliveryDate>${deliveryDate}</cbc:ActualDeliveryDate>` : ''}
-        <cac:DeliveryLocation>
-            ${delLocId ? `<cbc:ID>${esc(delLocId)}</cbc:ID>` : ''}
+        // Address group (BG-15) requires a country code (BT-80) — omit the whole group without one
+        const delAddressXml = delCountry ? `
             <cac:Address>
-                <cbc:StreetName>${esc(delAddr1)}</cbc:StreetName>
+                ${delAddr1 ? `<cbc:StreetName>${esc(delAddr1)}</cbc:StreetName>` : ''}
                 ${delAddr2 ? `<cbc:AdditionalStreetName>${esc(delAddr2)}</cbc:AdditionalStreetName>` : ''}
-                <cbc:CityName>${esc(delCity)}</cbc:CityName>
-                <cbc:PostalZone>${delZip}</cbc:PostalZone>
-                <cac:Country><cbc:IdentificationCode>${delCountry}</cbc:IdentificationCode></cac:Country>
-            </cac:Address>
-        </cac:DeliveryLocation>
+                ${delCity  ? `<cbc:CityName>${esc(delCity)}</cbc:CityName>` : ''}
+                ${delZip   ? `<cbc:PostalZone>${esc(delZip)}</cbc:PostalZone>` : ''}
+                <cac:Country><cbc:IdentificationCode>${esc(delCountry)}</cbc:IdentificationCode></cac:Country>
+            </cac:Address>` : '';
+
+        const delLocationXml = (delLoc || delAddressXml) ? `
+        <cac:DeliveryLocation>
+            ${delLoc ? `<cbc:ID schemeID="${delLoc.scheme}">${esc(delLoc.id)}</cbc:ID>` : ''}${delAddressXml}
+        </cac:DeliveryLocation>` : '';
+
+        const deliveryBlock = (deliveryDate || delLocationXml) ? `
+    <cac:Delivery>
+        ${deliveryDate ? `<cbc:ActualDeliveryDate>${deliveryDate}</cbc:ActualDeliveryDate>` : ''}${delLocationXml}
         ${delParty ? `<cac:DeliveryParty><cac:PartyName><cbc:Name>${esc(delParty)}</cbc:Name></cac:PartyName></cac:DeliveryParty>` : ''}
     </cac:Delivery>` : '';
 
@@ -568,7 +662,9 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log', 'N/render', 'N/fo
                 <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
             </cac:PartyTaxScheme>
             <cac:PartyLegalEntity>
+                <cbc:RegistrationName>${esc(custLegalName)}</cbc:RegistrationName>
                 <cbc:CompanyID schemeID="0002">${esc(custSiren)}</cbc:CompanyID>
+                <cbc:CompanyLegalForm>${esc(custLegalForm)}</cbc:CompanyLegalForm>
             </cac:PartyLegalEntity>
             <cac:Contact>
                 <cbc:Name>${esc(custName)}</cbc:Name>
