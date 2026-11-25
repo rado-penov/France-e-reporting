@@ -2,6 +2,22 @@
  * @NApiVersion 2.1
  * @NScriptType Restlet
  *
+ * Version history (date = commit date):
+ *   v1.0.0  (2026-08-21) - Initial release: inbound Basware BUM JSON -> Vendor Credit; lines
+ *                          read from invoiceLines.
+ *   v1.0.1  (2026-08-28) - Basware Generic Item fallback for unmatched lines; RESTlet-created
+ *                          credits skipped by the UBL export.
+ *   v1.0.2  (2026-10-01) - Duplicate France vendor credits blocked by vendor + reference number.
+ *   v1.0.3  (2026-10-21) - Transaction date off-by-one fixed.
+ *   v1.1.0  (2026-11-18) - Supplier PDF handling brought level with the bill RESTlet: EVERY file
+ *                          url is downloaded (attachments[].url, else every links[] rel='file'),
+ *                          one file per url as CreditMemo_<tranid>_<ddmmyyhhmm>[_n].pdf, each
+ *                          url best-effort and independent. HTTP Basic auth replaced by an
+ *                          OAuth2 client-credentials bearer token (new _vc OAuth parameters;
+ *                          _api_user_vc / _api_password_vc no longer read); Azure SAS urls are
+ *                          fetched without a token. Response adds pdfFileIds and pdfFiles.
+ *                          Host allowlist must now include api.basware.com.
+ *
  * Inbound AP JSON -> Vendor Credit RESTlet. Accepts Basware "BUM" JSON (same vendor as the
  * outbound NetSuite -> Basware UBL webhook, opposite direction) and creates a Vendor Credit.
  * Sibling of pret_fr_ap_vendorbill_rl.js — same logic, credit-note-shaped payload.
@@ -23,10 +39,6 @@
  * Standalone credits are left to NetSuite's own approval routing default (Pending Approval on
  * creation) — this script does not set an approval status field itself.
  *
- * Response contract: always HTTP 200; body is { success, internalId, bumId, message }.
- * TBC — confirm with Basware whether differentiated HTTP status codes per failure type
- * are actually required, or whether a body-level success flag is sufficient.
- *
  * Line coding: lines are built on the 'item' sublist (not 'expense'), with the NetSuite
  * Item resolved by matching data.creditNoteLines[].item's own seller item code against the
  * Item record's `itemid` field. Unlike the vendor bill payload, credit note lines observed so
@@ -37,23 +49,34 @@
  * item's own settings, same as the vendor bill RESTlet. The AP account on the credit header is
  * likewise never set explicitly; it always defaults to the vendor's payables account.
  *
- * Source PDF: the payload carries a `links` array; the entry with rel = 'file' is a Basware
- * API URL for the original supplier PDF. After the credit is saved (so the NetSuite tranid
- * exists) the PDF is downloaded with HTTP Basic auth, filed in the File Cabinet as
- * CreditMemo_<tranid>_<ddmmyyhhmm>.pdf and attached to the credit. This is best-effort: a
- * download failure is logged and reported in the response but never fails the credit.
+ * Supplier PDFs (ported from pret_fr_ap_vendorbill_rl.js, 2026-10-23): EVERY file url on the
+ * payload is downloaded after save, filed in the File Cabinet as
+ * CreditMemo_<tranid>_<ddmmyyhhmm>[_n].pdf and attached to the credit — one file per url. The
+ * urls come from `attachments[].url` when present (same shape as the bill payload); otherwise
+ * from every `links[]` entry with rel = 'file' — the live Basware credit-note payload
+ * (2026-10-23, Egencia FRC4999648) carries two such links (attachmentFile + imageFile) and no
+ * attachments[] at all. Authenticated with an OAuth2 client-credentials bearer token fetched
+ * once from the configured token endpoint and shared across the downloads — unless the url is
+ * an Azure SAS link (has a `sig=` query parameter), which is fetched with no Authorization
+ * header since Azure rejects two schemes. Best-effort and per-url — a failure on one attachment
+ * is reported but never stops the others, and never fails the credit. A bearer-token url is
+ * checked against a host allowlist (custscript_pret_ap_api_hosts_vc) before the token is sent,
+ * because the url arrives in the payload and decides where the token goes.
  *
- * The download URL is NOT a parameter — it arrives in the payload as an absolute href. Because
- * that href decides where the API credentials get sent, it is checked against an allowlist of
- * hosts before the request goes out (custscript_pret_ap_api_hosts_vc).
+ * Response contract: always HTTP 200; body is { success, internalId, bumId, message,
+ * pdfFileId (first file), pdfFileIds (all files), pdfFiles (per-url detail), pdfMessage }.
  *
  * Script parameters (all set on the Script record, valued per deployment):
- *   custscript_pret_ap_pdf_folder_vc    Integer  — File Cabinet folder internal ID
- *   custscript_pret_ap_api_user_vc      Free-Form Text — Basware API username
- *   custscript_pret_ap_api_password_vc  Password — Basware API password
- *   custscript_pret_ap_api_hosts_vc     Free-Form Text — comma-separated allowed hosts for the
- *                                       file link, e.g. 'test-api.basware.com'. Blank = no
- *                                       restriction (logged as a warning).
+ *   custscript_pret_ap_pdf_folder_vc       Integer  — File Cabinet folder internal ID
+ *   custscript_pret_ap_oauth_token_url_vc  Free-Form Text — OAuth2 token endpoint URL
+ *   custscript_pret_ap_oauth_client_id_vc  Free-Form Text — OAuth2 client_id
+ *   custscript_pret_ap_oauth_secret_vc     Password — OAuth2 client_secret
+ *   custscript_pret_ap_oauth_scope_vc      Free-Form Text — OAuth2 scope (optional)
+ *   custscript_pret_ap_api_hosts_vc        Free-Form Text — comma-separated allowed hosts for the
+ *                                          file url, e.g. 'api.basware.com'. Blank = no
+ *                                          restriction (logged as a warning).
+ *   (custscript_pret_ap_api_user_vc / custscript_pret_ap_api_password_vc — Basic auth — are no
+ *   longer read and can be removed from the Script record.)
  *
  * TBC / open items (mirrors pret_fr_ap_vendorbill_rl.js):
  *   - Currency: left to default from the resolved vendor rather than set explicitly from
@@ -62,18 +85,20 @@
  *     handles both an already-base64 body and a raw '%PDF' body — confirm against the live
  *     Basware endpoint which one it actually sends.
  */
-define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/runtime'],
-(record, search, log, https, file, encode, runtime) => {
+define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/runtime'],
+(record, search, log, https, file, runtime) => {
 
     const BUM_ID_FIELD        = 'custbody_pret_uuid';        // existing field, also used by pret_fr_evendorcredit_ue.js
     const VENDOR_SIRET_FIELD  = 'custentity_pret_siret';
     const APPROVAL_STATUS_FIELD = 'approvalstatus';
     const PENDING_APPROVAL_VALUE = '1';
 
-    const PARAM_PDF_FOLDER    = 'custscript_pret_ap_pdf_folder_vc';
-    const PARAM_API_USER      = 'custscript_pret_ap_api_user_vc';
-    const PARAM_API_PASSWORD  = 'custscript_pret_ap_api_password_vc';
-    const PARAM_API_HOSTS     = 'custscript_pret_ap_api_hosts_vc';
+    const PARAM_PDF_FOLDER          = 'custscript_pret_ap_pdf_folder_vc';
+    const PARAM_OAUTH_TOKEN_URL     = 'custscript_pret_ap_oauth_token_url_vc';
+    const PARAM_OAUTH_CLIENT_ID     = 'custscript_pret_ap_oauth_client_id_vc';
+    const PARAM_OAUTH_CLIENT_SECRET = 'custscript_pret_ap_oauth_secret_vc';
+    const PARAM_OAUTH_SCOPE         = 'custscript_pret_ap_oauth_scope_vc';
+    const PARAM_API_HOSTS           = 'custscript_pret_ap_api_hosts_vc';
 
     // Fallback item when a line's seller item code doesn't resolve to a real NetSuite Item.
     // 'Basware Generic Item' (internal ID 49662) — used instead of failing the whole credit.
@@ -190,12 +215,14 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
             // Post-submit: the tranid only exists once the record is saved.
             const pdf = attachSupplierPdf(requestBody, internalId, bumId);
 
-            log.audit('AP CREDIT COMPLETE', `bumId: ${bumId} | internalId: ${internalId} | pdfFileId: ${pdf.fileId}`);
+            log.audit('AP CREDIT COMPLETE', `bumId: ${bumId} | internalId: ${internalId} | pdfFileIds: [${pdf.fileIds.join(', ')}] | ${pdf.message}`);
             return {
                 success: true,
                 internalId,
                 bumId,
-                pdfFileId: pdf.fileId,
+                pdfFileId: pdf.fileId,          // first saved file — kept for existing consumers
+                pdfFileIds: pdf.fileIds,        // every saved file, one per url
+                pdfFiles: pdf.files,            // per-url { url, fileId, message }
                 pdfMessage: pdf.message,
                 message: 'Vendor credit created and marked Pending Approval'
             };
@@ -267,27 +294,47 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
         return results.length ? results[0].getValue('internalid') : null;
     }
 
-    // ── Supplier PDF: download from Basware and file in the File Cabinet ─────
+    // ── Supplier PDFs: download every file url and file in the File Cabinet ──
     // Runs after credit.save() so the NetSuite tranid is available for the filename.
-    // Best-effort: never throws — a failure here must not roll back a valid credit.
+    // One file per url — a credit note often carries several (the credit PDF plus an image or
+    // supporting document). Each url is handled independently: a failure on one is logged and
+    // reported but never stops the others, and never fails the credit.
+    // Returns { fileId, fileIds, message, files } — fileId is the first saved file (kept for
+    // backwards compatibility of the response), fileIds every saved file, files one entry per url.
     function attachSupplierPdf(requestBody, internalId, bumId) {
+        const summary = (files) => {
+            const fileIds = files.map(f => f.fileId).filter(Boolean);
+            const failed  = files.length - fileIds.length;
+            return {
+                fileId:  fileIds.length ? fileIds[0] : null,
+                fileIds,
+                files,
+                message: files.length
+                    ? `${fileIds.length} of ${files.length} attachment(s) saved` + (failed ? ` (${failed} failed)` : '')
+                    : 'No file url in payload'
+            };
+        };
+
         try {
-            const href = getFileLink(requestBody);
-            if (!href) {
-                log.audit('AP CREDIT PDF - NO FILE LINK', `bumId: ${bumId} | no links entry with rel='file'`);
-                return { fileId: null, message: 'No file link in payload' };
+            const hrefs = getFileLinks(requestBody);
+            if (!hrefs.length) {
+                log.audit('AP CREDIT PDF - NO FILE LINK', `bumId: ${bumId} | no attachments[].url and no links[] entry with rel='file'`);
+                return summary([]);
             }
+            log.audit('AP CREDIT PDF - ATTACHMENTS FOUND', `bumId: ${bumId} | ${hrefs.length} url(s) to download`);
 
-            const script     = runtime.getCurrentScript();
-            const folderId   = script.getParameter({ name: PARAM_PDF_FOLDER });
-            const apiUser    = script.getParameter({ name: PARAM_API_USER });
-            const apiPassword = script.getParameter({ name: PARAM_API_PASSWORD });
+            const script       = runtime.getCurrentScript();
+            const folderId     = script.getParameter({ name: PARAM_PDF_FOLDER });
+            const tokenUrl     = script.getParameter({ name: PARAM_OAUTH_TOKEN_URL });
+            const clientId     = script.getParameter({ name: PARAM_OAUTH_CLIENT_ID });
+            const clientSecret = script.getParameter({ name: PARAM_OAUTH_CLIENT_SECRET });
+            const scope        = script.getParameter({ name: PARAM_OAUTH_SCOPE });
+            const allowedHosts = script.getParameter({ name: PARAM_API_HOSTS });
 
-            if (!folderId)                return failPdf(bumId, `Script parameter ${PARAM_PDF_FOLDER} is not set`);
-            if (!apiUser || !apiPassword) return failPdf(bumId, `Script parameters ${PARAM_API_USER} / ${PARAM_API_PASSWORD} are not set`);
-
-            const hostError = checkHostAllowed(href, script.getParameter({ name: PARAM_API_HOSTS }), bumId);
-            if (hostError) return failPdf(bumId, hostError);
+            if (!folderId) {
+                const msg = failPdf(bumId, `Script parameter ${PARAM_PDF_FOLDER} is not set`).message;
+                return summary(hrefs.map(url => ({ url, fileId: null, message: msg })));
+            }
 
             const tranId = search.lookupFields({
                 type: search.Type.VENDOR_CREDIT,
@@ -295,70 +342,115 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
                 columns: ['tranid']
             }).tranid;
 
-            log.audit('AP CREDIT PDF - DOWNLOADING', `bumId: ${bumId} | tranid: ${tranId} | url: ${href}`);
+            // The OAuth token is fetched once, lazily, and shared by every non-SAS url.
+            let bearerToken = null;
+            const getBearerToken = () => {
+                if (bearerToken) return bearerToken;
+                if (!tokenUrl || !clientId || !clientSecret) {
+                    bearerToken = { error: `Script parameters ${PARAM_OAUTH_TOKEN_URL} / ${PARAM_OAUTH_CLIENT_ID} / ${PARAM_OAUTH_CLIENT_SECRET} are not set` };
+                } else {
+                    bearerToken = getOAuthToken(tokenUrl, clientId, clientSecret, scope, bumId);
+                }
+                return bearerToken;
+            };
 
-            // Headers mirror the Postman request that is known to return a valid PDF.
-            // Basware wants Content-Type: application/json even on this GET, and Accept: */*
-            // rather than application/pdf — narrowing Accept changes what the API returns.
-            const response = https.get({
-                url: href,
-                headers: {
-                    Authorization: basicAuthHeader(apiUser, apiPassword),
-                    'Content-Type': 'application/json',
-                    Accept: '*/*'
+            const files = hrefs.map((href, index) => {
+                const seq = index + 1;
+                try {
+                    const result = downloadAndAttachOne(href, {
+                        internalId, bumId, tranId, folderId, allowedHosts, getBearerToken,
+                        seq, total: hrefs.length
+                    });
+                    return { url: href, fileId: result.fileId, message: result.message };
+                } catch (e) {
+                    return { url: href, fileId: null, message: failPdf(bumId, `[${seq}/${hrefs.length}] ${e.name}: ${e.message}`).message };
                 }
             });
 
-            if (response.code !== 200) {
-                return failPdf(bumId, `Basware returned HTTP ${response.code}: ${String(response.body || '').substring(0, 300)}`);
-            }
-
-            const rawBody = String(response.body || '');
-            const headers = response.headers || {};
-            const contentType = headers['Content-Type'] || headers['content-type'] || '(none)';
-
-            // Diagnostic: the shape of this body decides how it must be encoded. Keep this —
-            // a blank PDF is almost always visible here as a length or prefix mismatch.
-            log.audit('AP CREDIT PDF - RESPONSE',
-                `bumId: ${bumId} | code: ${response.code} | contentType: ${contentType}`
-                + ` | bodyLength: ${rawBody.length} | first64: ${rawBody.substring(0, 64)}`);
-
-            if (!rawBody.length) {
-                return failPdf(bumId, 'Basware returned HTTP 200 with an empty body — nothing to save');
-            }
-
-            const contents = toBase64(rawBody, bumId);
-            if (!contents) {
-                return failPdf(bumId, 'Could not derive base64 PDF content from the response body');
-            }
-
-            const fileName = buildPdfName(tranId);
-            const pdfFile = file.create({
-                name: fileName,
-                fileType: file.Type.PDF,
-                contents,                            // binary file types expect base64 contents
-                folder: Number(folderId),
-                isOnline: false
-            });
-            const fileId = pdfFile.save();
-            log.audit('AP CREDIT PDF - SAVED', `bumId: ${bumId} | fileId: ${fileId} | name: ${fileName} | folder: ${folderId}`);
-
-            // Attach separately: the file is already safely in the cabinet at this point, so an
-            // attach failure must still report the fileId rather than collapse into failPdf().
-            try {
-                record.attach({
-                    record: { type: 'file', id: fileId },
-                    to:     { type: record.Type.VENDOR_CREDIT, id: internalId }
-                });
-                log.audit('AP CREDIT PDF - ATTACHED', `bumId: ${bumId} | fileId: ${fileId} attached to vendor credit ${internalId} (Communication > Files)`);
-                return { fileId, message: `Saved as ${fileName} and attached to the credit` };
-            } catch (attachErr) {
-                log.error('AP CREDIT PDF ATTACH FAILED', `bumId: ${bumId} | fileId: ${fileId} | internalId: ${internalId} | ${attachErr.name}: ${attachErr.message}`);
-                return { fileId, message: `Saved as ${fileName} but not attached: ${attachErr.message}` };
-            }
+            return summary(files);
 
         } catch (e) {
-            return failPdf(bumId, `${e.name}: ${e.message}`);
+            const msg = failPdf(bumId, `${e.name}: ${e.message}`).message;
+            return { fileId: null, fileIds: [], files: [], message: msg };
+        }
+    }
+
+    // Downloads ONE file url, saves it to the File Cabinet and attaches it to the credit.
+    // Returns { fileId, message }; fileId is null when the download or save failed.
+    function downloadAndAttachOne(href, ctx) {
+        const { internalId, bumId, tranId, folderId, allowedHosts, getBearerToken, seq, total } = ctx;
+        const tag = `[${seq}/${total}]`;
+
+        // A SAS link (Azure Blob, '?...&sig=...') carries its own authorization in the query
+        // string. Azure refuses a second scheme alongside it
+        // (DirectApiRequestHasMoreThanOneAuthorization), so no bearer token is fetched or
+        // sent — and with no token going out, the host allowlist has nothing to protect.
+        const isSasUrl = /[?&]sig=/i.test(href);
+        const requestHeaders = { 'Content-Type': 'application/json', Accept: '*/*' };
+
+        if (isSasUrl) {
+            log.audit('AP CREDIT PDF - SAS URL', `bumId: ${bumId} | ${tag} url carries a SAS signature; downloading without a bearer token`);
+        } else {
+            const hostError = checkHostAllowed(href, allowedHosts, bumId);
+            if (hostError) return failPdf(bumId, `${tag} ${hostError}`);
+
+            const token = getBearerToken();
+            if (token.error) return failPdf(bumId, `${tag} ${token.error}`);
+            requestHeaders.Authorization = `Bearer ${token.accessToken}`;
+        }
+
+        log.audit('AP CREDIT PDF - DOWNLOADING', `bumId: ${bumId} | ${tag} tranid: ${tranId} | url: ${href}`);
+
+        // Content-Type/Accept kept as on the original Basware request that is known to
+        // return a valid PDF — narrowing Accept to application/pdf changed what came back.
+        const response = https.get({ url: href, headers: requestHeaders });
+
+        if (response.code !== 200) {
+            return failPdf(bumId, `${tag} File endpoint returned HTTP ${response.code}: ${String(response.body || '').substring(0, 300)}`);
+        }
+
+        const rawBody = String(response.body || '');
+        const headers = response.headers || {};
+        const contentType = headers['Content-Type'] || headers['content-type'] || '(none)';
+
+        // Diagnostic: the shape of this body decides how it must be encoded. Keep this —
+        // a blank PDF is almost always visible here as a length or prefix mismatch.
+        log.audit('AP CREDIT PDF - RESPONSE',
+            `bumId: ${bumId} | ${tag} code: ${response.code} | contentType: ${contentType}`
+            + ` | bodyLength: ${rawBody.length} | first64: ${rawBody.substring(0, 64)}`);
+
+        if (!rawBody.length) {
+            return failPdf(bumId, `${tag} File endpoint returned HTTP 200 with an empty body — nothing to save`);
+        }
+
+        const contents = toBase64(rawBody, bumId);
+        if (!contents) {
+            return failPdf(bumId, `${tag} Could not derive base64 PDF content from the response body`);
+        }
+
+        const fileName = buildPdfName(tranId, seq);
+        const pdfFile = file.create({
+            name: fileName,
+            fileType: file.Type.PDF,
+            contents,                            // binary file types expect base64 contents
+            folder: Number(folderId),
+            isOnline: false
+        });
+        const fileId = pdfFile.save();
+        log.audit('AP CREDIT PDF - SAVED', `bumId: ${bumId} | ${tag} fileId: ${fileId} | name: ${fileName} | folder: ${folderId}`);
+
+        // Attach separately: the file is already safely in the cabinet at this point, so an
+        // attach failure must still report the fileId rather than collapse into failPdf().
+        try {
+            record.attach({
+                record: { type: 'file', id: fileId },
+                to:     { type: record.Type.VENDOR_CREDIT, id: internalId }
+            });
+            log.audit('AP CREDIT PDF - ATTACHED', `bumId: ${bumId} | ${tag} fileId: ${fileId} attached to vendor credit ${internalId} (Communication > Files)`);
+            return { fileId, message: `Saved as ${fileName} and attached to the credit` };
+        } catch (attachErr) {
+            log.error('AP CREDIT PDF ATTACH FAILED', `bumId: ${bumId} | ${tag} fileId: ${fileId} | internalId: ${internalId} | ${attachErr.name}: ${attachErr.message}`);
+            return { fileId, message: `Saved as ${fileName} but not attached: ${attachErr.message}` };
         }
     }
 
@@ -367,18 +459,74 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
         return { fileId: null, message };
     }
 
-    // links[] may sit at the top level of the payload or under data — accept either.
-    function getFileLink(requestBody) {
-        const links = (requestBody && requestBody.links)
-            || (requestBody && requestBody.data && requestBody.data.links)
+    // Returns EVERY file url on the payload (trimmed, blanks and exact repeats dropped), in
+    // payload order. Two shapes are accepted, each at the top level or under data:
+    //   1. attachments[].url — the shape the vendor bill payload uses; preferred when present.
+    //   2. links[] with rel='file' (method GET or absent) — the shape the live credit-note
+    //      payload uses (2026-10-23): two Basware /v2/files/<refId> hrefs, no attachments[].
+    // links[] is only consulted when attachments[] yields nothing, so a payload carrying both
+    // is never downloaded twice.
+    function getFileLinks(requestBody) {
+        const pick = (key) => (requestBody && requestBody[key])
+            || (requestBody && requestBody.data && requestBody.data[key])
             || [];
-        const match = links.find(l => l && l.rel === 'file'
-            && (!l.method || String(l.method).toUpperCase() === 'GET'));
-        return match ? match.href : null;
+        const clean = (urls) => urls
+            .map(u => (u == null ? '' : String(u).trim()))
+            .filter((u, i, arr) => u && arr.indexOf(u) === i);
+
+        const attachments = pick('attachments');
+        if (Array.isArray(attachments)) {
+            const urls = clean(attachments.map(a => a && a.url));
+            if (urls.length) return urls;
+        }
+
+        const links = pick('links');
+        if (!Array.isArray(links)) return [];
+        return clean(links
+            .filter(l => l && l.rel === 'file' && (!l.method || String(l.method).toUpperCase() === 'GET'))
+            .map(l => l.href));
     }
 
-    // The href is attacker-controllable input as far as this script is concerned: it decides
-    // where the Basware credentials are sent. Only talk to hosts we expect. Returns an error
+    // OAuth2 client-credentials grant. Returns { accessToken } or { error }.
+    // Credentials go in the form body (client_secret_post), which Azure AD / APIM accept.
+    function getOAuthToken(tokenUrl, clientId, clientSecret, scope, bumId) {
+        const form = {
+            grant_type: 'client_credentials',
+            client_id: clientId,
+            client_secret: clientSecret
+        };
+        if (scope) form.scope = scope;
+        const body = Object.keys(form)
+            .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(form[k])}`)
+            .join('&');
+
+        const response = https.post({
+            url: tokenUrl,
+            body,
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Accept: 'application/json'
+            }
+        });
+
+        if (response.code !== 200) {
+            return { error: `OAuth token endpoint returned HTTP ${response.code}: ${String(response.body || '').substring(0, 300)}` };
+        }
+
+        let parsed;
+        try { parsed = JSON.parse(response.body); } catch (e) {
+            return { error: `OAuth token response is not JSON: ${String(response.body || '').substring(0, 300)}` };
+        }
+        if (!parsed.access_token) {
+            return { error: `OAuth token response has no access_token: ${String(response.body || '').substring(0, 300)}` };
+        }
+
+        log.audit('AP CREDIT PDF - TOKEN OBTAINED', `bumId: ${bumId} | token_type: ${parsed.token_type || '(none)'} | expires_in: ${parsed.expires_in || '(none)'}`);
+        return { accessToken: parsed.access_token };
+    }
+
+    // The url is attacker-controllable input as far as this script is concerned: it decides
+    // where the bearer token is sent. Only talk to hosts we expect. Returns an error
     // string when the link should be refused, or null when it is safe to proceed.
     function checkHostAllowed(href, allowedParam, bumId) {
         const match = /^https:\/\/([^\/:?#]+)/i.exec(String(href || ''));
@@ -392,27 +540,19 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
 
         if (!allowed.length) {
             log.audit('AP CREDIT PDF - HOST NOT RESTRICTED',
-                `bumId: ${bumId} | ${PARAM_API_HOSTS} is blank; sending credentials to ${host}`);
+                `bumId: ${bumId} | ${PARAM_API_HOSTS} is blank; sending bearer token to ${host}`);
             return null;
         }
         if (allowed.indexOf(host) === -1) {
-            return `Refusing to send credentials to unexpected host '${host}' (allowed: ${allowed.join(', ')})`;
+            return `Refusing to send bearer token to unexpected host '${host}' (allowed: ${allowed.join(', ')})`;
         }
         return null;
     }
 
-    function basicAuthHeader(user, password) {
-        // encode.convert can wrap long output across lines; headers must be a single line.
-        const encoded = encode.convert({
-            string: `${user}:${password}`,
-            inputEncoding: encode.Encoding.UTF_8,
-            outputEncoding: encode.Encoding.BASE_64
-        }).replace(/[\r\n]/g, '');
-        return `Basic ${encoded}`;
-    }
-
-    // 'CreditMemo_INVFR123456_1408261036.pdf' — ddmmyyhhmm in account time.
-    function buildPdfName(tranId) {
+    // 'CreditMemo_FRC4999648_2310261036.pdf' — ddmmyyhhmm in account time. The 2nd, 3rd, ...
+    // file of the same credit gets a '_2', '_3', ... suffix so files downloaded within the
+    // same minute never share a name: 'CreditMemo_FRC4999648_2310261036_2.pdf'.
+    function buildPdfName(tranId, seq) {
         const d = new Date();
         const pad = n => String(n).padStart(2, '0');
         const stamp = pad(d.getDate())
@@ -420,7 +560,8 @@ define(['N/record', 'N/search', 'N/log', 'N/https', 'N/file', 'N/encode', 'N/run
             + String(d.getFullYear()).slice(-2)
             + pad(d.getHours())
             + pad(d.getMinutes());
-        return `CreditMemo_${tranId || 'UNKNOWN'}_${stamp}.pdf`;
+        const suffix = seq && seq > 1 ? `_${seq}` : '';
+        return `CreditMemo_${tranId || 'UNKNOWN'}_${stamp}${suffix}.pdf`;
     }
 
     // https.get hands the body back as a *string*, so the shape depends on how NetSuite

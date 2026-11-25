@@ -2,6 +2,15 @@
  * @NApiVersion 2.1
  * @NScriptType ScheduledScript
  *
+ * Version history (date = commit date):
+ *   v1.0.0  (2026-09-24) - Initial release: B2B bills payments report from
+ *                          customsearch_pret_france_bills_b2b; Issuer RoleCode BY; _vbb
+ *                          parameters; JWT-claim diagnostics.
+ *   v1.0.1  (2026-09-25) - Test-only 'today' override parameter and raw-token debug log removed.
+ *   v1.1.0  (2026-11-18) - 'Today is' override re-added for testing (custscript_pret_today_is_vbb,
+ *                          Date). When blank the real date is used, so production is unaffected;
+ *                          leave it blank on live deployments.
+ *
  * Builds a B2B Bills (Vendor Bill) Payments Report XML from saved search 'customsearch_pret_france_bills_b2b',
  * saves it to the File Cabinet and sends it via HTTPS API.
  *
@@ -43,6 +52,9 @@
  *   custscript_pret_oauth_scope_vbb          Free-form text            — OAuth2 scope
  *   custscript_pret_api_doc_type_vbb         Free-form text            — Value sent as the X-Pret-Document-Type header
  *   custscript_pret_ubl_folder_vbb           Integer                   — File Cabinet folder ID for XML files
+ *   custscript_pret_today_is_vbb             Date                      — 'Today is' (testing only): when set, the
+ *                                                                        script runs as if today were this date (e.g.
+ *                                                                        the 1st, 11th or 21st). Leave blank in production.
  */
 define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/encode', 'N/log'],
 (search, file, https, runtime, format, encode, log) => {
@@ -66,8 +78,9 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/encode', 'N
             const oauthConfigured = !!(tokenUrl && clientId && clientSecret && scope);
             log.audit('B2B BILLS REPORT START', `Deployment: ${script.deploymentId} | url set: ${!!apiUrl} | oauth configured: ${oauthConfigured} | docType: ${apiDocType || '(empty)'} | folderId: ${folderId}`);
 
-            const today = new Date();
-            log.debug('B2B BILLS REPORT TODAY RESOLVED', `Today: ${fmtYYYYMMDD(today)} (day of month: ${today.getDate()})`);
+            const todayOverride = script.getParameter({ name: 'custscript_pret_today_is_vbb' });
+            const today = resolveToday(todayOverride);
+            log.debug('B2B BILLS REPORT TODAY RESOLVED', `Today: ${fmtYYYYMMDD(today)} (day of month: ${today.getDate()}) | simulated: ${!!todayOverride}`);
 
             const window = resolveWindow(today);
             if (!window) {
@@ -140,6 +153,14 @@ define(['N/search', 'N/file', 'N/https', 'N/runtime', 'N/format', 'N/encode', 'N
     }
 
     // ── date / window helpers ────────────────────────────────────────────────
+    // 'Today is' override (testing only) — Date params normally come back as a Date, but accept
+    // a date string too. Returns local midnight of that day; falls back to the real date if blank.
+    function resolveToday(override) {
+        if (!override) return new Date();
+        const d = override instanceof Date ? override : format.parse({ value: override, type: format.Type.DATE });
+        return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    }
+
     // today=11 -> 1st-10th | today=21 -> 11th-20th | today=1 -> prev month 21st..end (excl. today) | else null
     function resolveWindow(today) {
         const y = today.getFullYear();
