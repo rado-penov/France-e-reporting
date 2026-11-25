@@ -22,6 +22,9 @@
  *                          (custentity_pret_company_legal_name / _legal_form). HTML tags are
  *                          stripped from the seller CompanyLegalForm and the #PMT# note. Ship-to address read from the shippingaddress
  *                          subrecord; empty CityName/PostalZone/StreetName elements are omitted.
+ *   v1.1.2  (2026-11-23) - Restore the standard OASIS UBL 2.1 namespaces (default Invoice-2, cac,
+ *                          cbc) on the root element; the placeholder pret.com URIs made schema
+ *                          validators reject the document ("No matching global declaration").
  *
  * Generates a UBL 2.1 / EN 16931 XML for French e-invoicing on invoice save,
  * saves it to the File Cabinet, sends it via HTTPS API and stamps the three
@@ -595,7 +598,7 @@ define(['N/record', 'N/file', 'N/https', 'N/runtime', 'N/log', 'N/render', 'N/fo
     </cac:PaymentTerms>` : '';
 
         // ── Assemble ─────────────────────────────────────────────────────────
-        return `<Invoice xmlns:xsi="http://pret.com/schemas/invoice" xmlns:cbc="https://pret.com/schemas/cbc" xmlns:cac="https://pret.com/schemas/cac">
+        return `<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2" xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
     <cbc:UBLVersionID>2.1</cbc:UBLVersionID>
     <cbc:CustomizationID>urn:cen.eu:en16931:2017</cbc:CustomizationID>
     <cbc:ProfileID>B1</cbc:ProfileID>
